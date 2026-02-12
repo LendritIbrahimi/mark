@@ -1,0 +1,9 @@
+openai>=1.0
+fastmcp>=2.0
+pydantic>=2.0
+pyobjc-framework-Cocoa
+pyobjc-framework-ApplicationServices
+pyobjc-framework-Quartz
+pyautogui
+Pillow
+python-dotenv

@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Debug logs (generated per agent run)
+debug_logs/
+**/debug_logs/
+
+# Temp screenshots
+*.tmp.png
+*.tmp.jpg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy / type checkers
+.mypy_cache/
+.dmypy.json
