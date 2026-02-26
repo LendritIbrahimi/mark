@@ -32,6 +32,7 @@ INTERACTABLE_ROLES = {
     "AXComboBox", "AXSlider", "AXMenuButton", "AXMenuItem",
     "AXTab", "AXImage", "AXStaticText", "AXIncrementor",
     "AXHeading", "AXDockItem", "AXMenuBarItem",
+    "AXSheet", "AXDialog",
 }
 
 ROLE_DISPLAY_NAMES: dict[str, str] = {
@@ -53,7 +54,11 @@ ROLE_DISPLAY_NAMES: dict[str, str] = {
     "AXIncrementor": "Stepper",
     "AXHeading": "Heading",
     "AXDockItem": "DockItem",
+    "AXSheet": "Dialog",
+    "AXDialog": "Dialog",
 }
+
+_DIALOG_ROLES = {"AXSheet", "AXDialog"}
 
 # ---------------------------------------------------------------------------
 # Screen helpers
@@ -137,6 +142,23 @@ def _build_label(element: Any) -> str:
     return ""
 
 
+def _collect_states(element: Any, role: str) -> list[str]:
+    """Read boolean AX attributes to build a compact state-tag list."""
+    states: list[str] = []
+    if _ax_attr(element, "AXFocused"):
+        states.append("FOCUSED")
+    if _ax_attr(element, "AXSelected"):
+        states.append("SELECTED")
+    enabled = _ax_attr(element, "AXEnabled")
+    if enabled is not None and not enabled:
+        states.append("DISABLED")
+    if role in ("AXCheckBox", "AXRadioButton") and _ax_attr(element, "AXValue"):
+        states.append("CHECKED")
+    if _ax_attr(element, "AXExpanded"):
+        states.append("EXPANDED")
+    return states
+
+
 # ---------------------------------------------------------------------------
 # Tree walker
 # ---------------------------------------------------------------------------
@@ -166,6 +188,7 @@ def _walk_tree(
                 "label": _build_label(element),
                 "x": pos[0], "y": pos[1],
                 "w": size[0], "h": size[1],
+                "states": _collect_states(element, role),
             })
 
     children = _ax_attr(element, "AXChildren")
@@ -192,6 +215,7 @@ class UIElement:
     y: int
     w: int
     h: int
+    states: list[str]
 
     @property
     def center(self) -> tuple[int, int]:
@@ -214,10 +238,13 @@ class UIElement:
         return {"id": self.id, "x": cx, "y": cy}
 
     def format_entry(self) -> str:
-        """e.g. [3] Button: \"Submit\" """
-        if self.label:
-            return f'[{self.id}] {self.display_role}: "{self.label}"'
-        return f"[{self.id}] {self.display_role}"
+        """e.g. [3] [FOCUSED] Button: \"Submit\" """
+        tags = " ".join(f"[{s}]" for s in self.states)
+        parts = [f"[{self.id}]"]
+        if tags:
+            parts.append(tags)
+        parts.append(f'{self.display_role}: "{self.label}"' if self.label else self.display_role)
+        return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -282,13 +309,18 @@ def get_accessibility_elements(
         logger.info("Frontmost app: %s (PID %d)", app_name, pid)
         app_ref = AXUIElementCreateApplication(pid)
 
-        _walk_tree(app_ref, app_raw, raw_limit)
-        count_children = len(app_raw)
-
-        menu_bar = _ax_attr(app_ref, "AXMenuBar")
-        if menu_bar and len(app_raw) < raw_limit:
-            _walk_tree(menu_bar, app_raw, raw_limit, depth=1)
-        count_menu = len(app_raw) - count_children
+        # Walk the focused window first so dialog / sheet content is
+        # captured before hitting the raw-element budget.
+        focused_win = _ax_attr(app_ref, "AXFocusedWindow")
+        if focused_win:
+            for child in (_ax_attr(focused_win, "AXChildren") or []):
+                if len(app_raw) >= raw_limit:
+                    break
+                child_role = _ax_attr(child, "AXRole") or ""
+                if child_role in _DIALOG_ROLES:
+                    _walk_tree(child, app_raw, raw_limit, depth=1)
+            _walk_tree(focused_win, app_raw, raw_limit, depth=1)
+        count_focused = len(app_raw)
 
         before_win = len(app_raw)
         windows = _ax_attr(app_ref, "AXWindows")
@@ -299,9 +331,19 @@ def get_accessibility_elements(
                 _walk_tree(win, app_raw, raw_limit, depth=1)
         count_win = len(app_raw) - before_win
 
+        before_menu = len(app_raw)
+        menu_bar = _ax_attr(app_ref, "AXMenuBar")
+        if menu_bar and len(app_raw) < raw_limit:
+            _walk_tree(menu_bar, app_raw, raw_limit, depth=1)
+        count_menu = len(app_raw) - before_menu
+
+        # Catch-all: app-level AXChildren (non-window elements)
+        if len(app_raw) < raw_limit:
+            _walk_tree(app_ref, app_raw, raw_limit)
+
         logger.info(
-            "PID %d: %d children, %d menu-bar, %d window elements",
-            pid, count_children, count_menu, count_win,
+            "PID %d: %d focused-win, %d other-win, %d menu-bar elements",
+            pid, count_focused, count_win, count_menu,
         )
 
     dock_raw: list[dict] = []
@@ -335,7 +377,7 @@ def get_accessibility_elements(
 
         visible.append(UIElement(
             id=len(visible), role=item["role"], label=item["label"],
-            x=x, y=y, w=w, h=h,
+            x=x, y=y, w=w, h=h, states=item.get("states", []),
         ))
 
     visible = visible[:max_elements]

@@ -8,7 +8,7 @@ import time
 
 from servers.vision.server import observe
 
-DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug")
+DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug_logs", "test_vision")
 
 
 def run():

@@ -31,6 +31,8 @@ ROLE_COLORS: dict[str, str] = {
     "AXHeading": "#FF9100",
     "AXSlider": "#B388FF",
     "AXDockItem": "#00E5FF",
+    "AXSheet": "#FFD600",
+    "AXDialog": "#FFD600",
 }
 DEFAULT_COLOR = "#FF2D2D"
 

@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import logging
 import sys
-import time
 
 from dotenv import load_dotenv
 
@@ -64,8 +63,6 @@ def main() -> None:
     print(f"Task: {args.task}")
     print(f"Model: {config.model} | Max steps: {config.max_steps}")
     print("-" * 60)
-
-    time.sleep(5)
 
     try:
         asyncio.run(run_agent(args.task, config))
