@@ -111,5 +111,5 @@ def draw_labels(
     img.save(buf, format="JPEG", quality=85)
     labeled_b64 = base64.b64encode(buf.getvalue()).decode()
 
-    logger.info("Labeled %d elements", len(elements))
+    logger.debug("Labeled %d elements", len(elements))
     return labeled_b64

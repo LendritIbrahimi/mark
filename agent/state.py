@@ -47,12 +47,12 @@ class StateManager:
                     "Screen appears unchanged after your last action. "
                     "It may not have worked -- try a different approach."
                 )
-                logger.info("Screen unchanged warning (elements=%d)", current_count)
+                logger.debug("Screen unchanged warning (elements=%d)", current_count)
         else:
             self.loop_warning = ""
         self._prev_element_count = current_count
 
-        logger.info("UI updated: %d elements", len(positions))
+        logger.debug("UI updated: %d elements", len(positions))
 
     def resolve_element(self, element_id: int) -> tuple[int, int] | None:
         """Resolve an element ID to its center (x, y) in pixel coordinates."""

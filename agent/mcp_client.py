@@ -31,7 +31,7 @@ class MCPClient:
         await self._session.initialize()
         tools_response = await self._session.list_tools()
         self._tools = [t.name for t in tools_response.tools]
-        logger.info("MCP '%s': connected, tools=%s", self.name, self._tools)
+        logger.debug("MCP '%s': connected, tools=%s", self.name, self._tools)
 
     @property
     def tools(self) -> list[str]:
@@ -91,12 +91,18 @@ async def connect_mcp(
         args=args,
         env=env,
     )
-    logger.info("Starting MCP server '%s': %s %s", name, command, " ".join(args))
+    logger.debug("Starting MCP server '%s': %s %s", name, command, " ".join(args))
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            client = MCPClient(name, session)
-            await client.initialize()
-            yield client
+    quiet = os.environ.get("MARK_LOG_LEVEL", "WARNING") != "DEBUG"
+    errlog = open(os.devnull, "w") if quiet else sys.stderr
 
-    logger.info("MCP server '%s' disconnected", name)
+    try:
+        async with stdio_client(server_params, errlog=errlog) as (read, write):
+            async with ClientSession(read, write) as session:
+                client = MCPClient(name, session)
+                await client.initialize()
+                yield client
+        logger.debug("MCP server '%s' disconnected", name)
+    finally:
+        if errlog is not sys.stderr:
+            errlog.close()

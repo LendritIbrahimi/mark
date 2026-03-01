@@ -23,6 +23,11 @@ from ApplicationServices import (
     kAXErrorSuccess,
 )
 from AppKit import NSScreen, NSWorkspace
+from Quartz import (
+    CGWindowListCopyWindowInfo,
+    kCGWindowListOptionOnScreenOnly,
+    kCGNullWindowID,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +221,7 @@ class UIElement:
     w: int
     h: int
     states: list[str]
+    source: str = ""
 
     @property
     def center(self) -> tuple[int, int]:
@@ -238,11 +244,13 @@ class UIElement:
         return {"id": self.id, "x": cx, "y": cy}
 
     def format_entry(self) -> str:
-        """e.g. [3] [FOCUSED] Button: \"Submit\" """
+        """e.g. [3] [FOCUSED] (Safari) Button: \"Submit\" """
         tags = " ".join(f"[{s}]" for s in self.states)
         parts = [f"[{self.id}]"]
         if tags:
             parts.append(tags)
+        if self.source:
+            parts.append(f"({self.source})")
         parts.append(f'{self.display_role}: "{self.label}"' if self.label else self.display_role)
         return " ".join(parts)
 
@@ -274,11 +282,112 @@ def _get_frontmost_pid() -> tuple[int, str] | tuple[None, str]:
     return int(pid), str(name)
 
 
+def _find_context_menu(app_ref: Any) -> Any | None:
+    """If a context/popup menu is open, return its root AXMenu element.
+
+    Follows the app's AXFocusedUIElement up through parents.  If the
+    chain passes through an AXMenu *without* going through AXMenuBar,
+    that menu is a context menu (not a menu-bar dropdown).
+    """
+    focused = _ax_attr(app_ref, "AXFocusedUIElement")
+    if focused is None:
+        return None
+
+    menu = None
+    current = focused
+    for _ in range(20):
+        role = _ax_attr(current, "AXRole") or ""
+        if role == "AXMenu":
+            menu = current
+        elif role == "AXMenuBar":
+            return None
+        elif role == "AXApplication":
+            break
+        parent = _ax_attr(current, "AXParent")
+        if parent is None:
+            break
+        current = parent
+    return menu
+
+
 def _get_dock_pid() -> int | None:
     for app in NSWorkspace.sharedWorkspace().runningApplications():
         if app.localizedName() == "Dock":
             return app.processIdentifier()
     return None
+
+
+# ---------------------------------------------------------------------------
+# Multi-app discovery via CGWindowList
+# ---------------------------------------------------------------------------
+
+_MIN_WINDOW_AREA = 50 * 50
+
+
+def _get_onscreen_windows() -> list[dict]:
+    """Return all normal-layer on-screen windows, ordered front-to-back.
+
+    Each dict has keys: pid, x, y, w, h, owner.
+    """
+    windows = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly, kCGNullWindowID,
+    )
+    if not windows:
+        return []
+
+    result: list[dict] = []
+    for w in windows:
+        layer = int(w.get("kCGWindowLayer", 0))
+        if layer != 0:
+            continue
+
+        bounds = w.get("kCGWindowBounds", {})
+        x = int(bounds.get("X", 0))
+        y = int(bounds.get("Y", 0))
+        width = int(bounds.get("Width", 0))
+        height = int(bounds.get("Height", 0))
+
+        if width * height < _MIN_WINDOW_AREA:
+            continue
+
+        result.append({
+            "pid": int(w.get("kCGWindowOwnerPID", 0)),
+            "x": x, "y": y, "w": width, "h": height,
+            "owner": str(w.get("kCGWindowOwnerName", "?")),
+        })
+    return result
+
+
+def _get_visible_app_pids(
+    exclude_pids: set[int],
+    windows: list[dict],
+) -> list[tuple[int, str]]:
+    """Unique (pid, app_name) pairs for visible background apps, front-to-back."""
+    seen: set[int] = set()
+    result: list[tuple[int, str]] = []
+    for w in windows:
+        pid = w["pid"]
+        if pid in exclude_pids or pid in seen:
+            continue
+        seen.add(pid)
+        result.append((pid, w["owner"]))
+    return result
+
+
+def _is_occluded(cx: int, cy: int, elem_pid: int, windows: list[dict]) -> bool:
+    """True if the point (cx, cy) is hidden behind a higher-z window from another app.
+
+    Windows are ordered front-to-back.  If we encounter a window from the
+    element's own PID first, the point is visible.  If we hit a foreign
+    window that contains the point first, it's occluded.
+    """
+    for w in windows:
+        if w["pid"] == elem_pid:
+            return False
+        if (w["x"] <= cx <= w["x"] + w["w"]
+                and w["y"] <= cy <= w["y"] + w["h"]):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -289,12 +398,12 @@ def _get_dock_pid() -> int | None:
 def get_accessibility_elements(
     max_elements: int = 150,
 ) -> tuple[list[UIElement], float]:
-    """Read interactable elements from the frontmost app and the Dock.
+    """Read interactable elements from all visible apps and the Dock.
 
     Traverses AXChildren, AXMenuBar, and AXWindows of the frontmost app,
-    then the Dock.  Coordinates stay in point-space (matching pyautogui's
-    click coordinate system).  Off-screen elements are discarded and
-    duplicates (same position and size) are collapsed.
+    then visible background apps (with a proportional budget), then the Dock.
+    Background elements whose center is occluded by a higher-z window are
+    discarded.  Off-screen elements and duplicates are also collapsed.
 
     Returns (elements, backing_scale) where backing_scale is the Retina
     factor needed by the labeler to map point-space onto the screenshot.
@@ -302,15 +411,19 @@ def get_accessibility_elements(
     _DOCK_BUDGET = 30
     raw_limit = max_elements * 3
 
+    # -- Frontmost app (gets first priority on the element budget) --
+
     app_raw: list[dict] = []
 
     pid, app_name = _get_frontmost_pid()
     if pid is not None:
-        logger.info("Frontmost app: %s (PID %d)", app_name, pid)
+        logger.debug("Frontmost app: %s (PID %d)", app_name, pid)
         app_ref = AXUIElementCreateApplication(pid)
 
-        # Walk the focused window first so dialog / sheet content is
-        # captured before hitting the raw-element budget.
+        ctx_menu = _find_context_menu(app_ref)
+        if ctx_menu is not None:
+            _walk_tree(ctx_menu, app_raw, raw_limit, depth=1)
+
         focused_win = _ax_attr(app_ref, "AXFocusedWindow")
         if focused_win:
             for child in (_ax_attr(focused_win, "AXChildren") or []):
@@ -320,47 +433,67 @@ def get_accessibility_elements(
                 if child_role in _DIALOG_ROLES:
                     _walk_tree(child, app_raw, raw_limit, depth=1)
             _walk_tree(focused_win, app_raw, raw_limit, depth=1)
-        count_focused = len(app_raw)
 
-        before_win = len(app_raw)
         windows = _ax_attr(app_ref, "AXWindows")
         if windows:
             for win in windows:
                 if len(app_raw) >= raw_limit:
                     break
                 _walk_tree(win, app_raw, raw_limit, depth=1)
-        count_win = len(app_raw) - before_win
 
-        before_menu = len(app_raw)
         menu_bar = _ax_attr(app_ref, "AXMenuBar")
         if menu_bar and len(app_raw) < raw_limit:
             _walk_tree(menu_bar, app_raw, raw_limit, depth=1)
-        count_menu = len(app_raw) - before_menu
 
-        # Catch-all: app-level AXChildren (non-window elements)
         if len(app_raw) < raw_limit:
             _walk_tree(app_ref, app_raw, raw_limit)
 
-        logger.info(
-            "PID %d: %d focused-win, %d other-win, %d menu-bar elements",
-            pid, count_focused, count_win, count_menu,
-        )
+        logger.debug("PID %d: %d raw elements collected", pid, len(app_raw))
+
+    # -- Visible background apps (share the remaining budget) --
+
+    onscreen_windows = _get_onscreen_windows()
+
+    dock_pid = _get_dock_pid()
+    exclude_pids: set[int] = set()
+    if pid is not None:
+        exclude_pids.add(pid)
+    if dock_pid is not None:
+        exclude_pids.add(dock_pid)
+
+    bg_pids = _get_visible_app_pids(exclude_pids, onscreen_windows)
+
+    if bg_pids:
+        bg_budget = max(20, (raw_limit - len(app_raw)) // len(bg_pids))
+        for bg_pid, bg_name in bg_pids:
+            bg_raw: list[dict] = []
+            bg_ref = AXUIElementCreateApplication(bg_pid)
+            _walk_tree(bg_ref, bg_raw, bg_budget)
+            for item in bg_raw:
+                item["source"] = bg_name
+                item["pid"] = bg_pid
+            app_raw.extend(bg_raw)
+            if bg_raw:
+                logger.debug("BG app %s (PID %d): %d elements", bg_name, bg_pid, len(bg_raw))
+
+    # -- Dock --
 
     dock_raw: list[dict] = []
-    dock_pid = _get_dock_pid()
     if dock_pid is not None:
         dock_ref = AXUIElementCreateApplication(dock_pid)
         _walk_tree(dock_ref, dock_raw, _DOCK_BUDGET)
-        logger.info("Dock: %d elements", len(dock_raw))
+        logger.debug("Dock: %d elements", len(dock_raw))
 
     raw = app_raw + dock_raw
+
+    # -- Dedup, screen-clip, and occlusion filtering --
 
     backing_scale = _get_backing_scale()
     sw, sh = _get_screen_point_size()
 
     seen: set[tuple[int, int, int, int]] = set()
     visible: list[UIElement] = []
-    skipped = dupes = 0
+    skipped = dupes = occluded = 0
 
     for item in raw:
         x, y, w, h = item["x"], item["y"], item["w"], item["h"]
@@ -368,6 +501,12 @@ def get_accessibility_elements(
         if not _overlaps_screen(x, y, w, h, sw, sh):
             skipped += 1
             continue
+
+        if item.get("source") and onscreen_windows:
+            cx, cy = x + w // 2, y + h // 2
+            if _is_occluded(cx, cy, item["pid"], onscreen_windows):
+                occluded += 1
+                continue
 
         key = (x, y, w, h)
         if key in seen:
@@ -377,13 +516,15 @@ def get_accessibility_elements(
 
         visible.append(UIElement(
             id=len(visible), role=item["role"], label=item["label"],
-            x=x, y=y, w=w, h=h, states=item.get("states", []),
+            x=x, y=y, w=w, h=h,
+            states=item.get("states", []),
+            source=item.get("source", ""),
         ))
 
     visible = visible[:max_elements]
 
-    logger.info(
-        "Total: %d visible (%d off-screen, %d dupes, backing_scale=%.1f)",
-        len(visible), skipped, dupes, backing_scale,
+    logger.debug(
+        "Total: %d visible (%d off-screen, %d dupes, %d occluded, backing_scale=%.1f)",
+        len(visible), skipped, dupes, occluded, backing_scale,
     )
     return visible, backing_scale

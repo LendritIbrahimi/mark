@@ -25,7 +25,7 @@ def create_session_dir(task: str, base_dir: str = DEFAULT_BASE_DIR) -> str:
     folder_name = f"{timestamp}__{_sanitize(task)}"
     session_dir = os.path.join(base_dir, folder_name)
     os.makedirs(session_dir, exist_ok=True)
-    logger.info("Debug session: %s", session_dir)
+    logger.debug("Debug session: %s", session_dir)
     return session_dir
 
 

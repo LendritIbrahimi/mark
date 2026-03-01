@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 
 from dotenv import load_dotenv
@@ -35,8 +36,13 @@ def main() -> None:
     )
     parser.add_argument("task", help="Natural-language task to accomplish")
     parser.add_argument(
-        "--model", default="gpt-4o-mini",
-        help="OpenAI model (default: gpt-4o-mini)",
+        "--provider", default="openai",
+        choices=["openai", "gemini", "ollama"],
+        help="LLM provider (default: openai)",
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="Model name (default: provider-specific)",
     )
     parser.add_argument(
         "--max-steps", type=int, default=100,
@@ -46,23 +52,54 @@ def main() -> None:
         "--screenshot-width", type=int, default=1280,
         help="Screenshot width in pixels (default: 1280)",
     )
+    parser.add_argument(
+        "--no-vision", action="store_true",
+        help="Don't send screenshots to the LLM (element list only)",
+    )
+    parser.add_argument(
+        "--omniparser", action="store_true",
+        help="Use OmniParser v2 for element detection instead of accessibility tree",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Show detailed timing and debug information",
+    )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    if args.verbose:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
+        os.environ["MARK_LOG_LEVEL"] = "DEBUG"
+    else:
+        from agent.console import ConsoleFormatter
+        handler = logging.StreamHandler()
+        handler.setFormatter(ConsoleFormatter())
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
+        os.environ["MARK_LOG_LEVEL"] = "WARNING"
+
+    for noisy in ("httpx", "httpcore", "openai", "google", "google_genai", "ollama", "mcp"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    default_models = {
+        "openai": "gpt-4o-mini",
+        "gemini": "gemini-2.0-flash",
+        "ollama": "llama3.2-vision",
+    }
+    model = args.model or default_models.get(args.provider, "gpt-4o-mini")
 
     config = MarkConfig(
-        model=args.model,
+        provider=args.provider,
+        model=model,
         max_steps=args.max_steps,
         screenshot_width=args.screenshot_width,
+        send_images=not args.no_vision,
+        use_omniparser=args.omniparser,
     )
 
     print(f"Task: {args.task}")
-    print(f"Model: {config.model} | Max steps: {config.max_steps}")
-    print("-" * 60)
 
     try:
         asyncio.run(run_agent(args.task, config))

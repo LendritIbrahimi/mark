@@ -32,7 +32,7 @@ def capture_screenshot(target_width: int = 1280) -> tuple[str, int, int, float]:
     scaled.save(buf, format="JPEG", quality=75)
     b64 = base64.b64encode(buf.getvalue()).decode()
 
-    logger.info(
+    logger.debug(
         "Screenshot: %dx%d -> %dx%d (scale %.2f)",
         real_w, real_h, target_width, new_h, scale,
     )

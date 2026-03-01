@@ -12,11 +12,11 @@ from fastmcp import FastMCP
 
 from servers.action import mouse, keyboard
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+import os as _os
+
+_log_level = getattr(logging, _os.environ.get("MARK_LOG_LEVEL", "WARNING"), logging.WARNING)
+logging.basicConfig(level=_log_level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
+logging.getLogger("mcp").setLevel(max(_log_level, logging.WARNING))
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("mark-action")

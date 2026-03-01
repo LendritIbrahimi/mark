@@ -11,14 +11,16 @@ NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPo
 from fastmcp import FastMCP
 
 from servers.vision.screenshot import capture_screenshot
-from servers.vision.accessibility import get_accessibility_elements
+from servers.vision.accessibility import get_accessibility_elements, _get_backing_scale
 from servers.vision.labeler import draw_labels
+from servers.vision.overlay import get_overlay_elements
+from servers.vision.omniparser import get_omniparser_elements
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+import os as _os
+
+_log_level = getattr(logging, _os.environ.get("MARK_LOG_LEVEL", "WARNING"), logging.WARNING)
+logging.basicConfig(level=_log_level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
+logging.getLogger("mcp").setLevel(max(_log_level, logging.WARNING))
 
 mcp = FastMCP("mark-vision")
 
@@ -30,6 +32,7 @@ MAX_ELEMENTS = 150
 def observe(
     width: int = SCREENSHOT_WIDTH,
     max_elements: int = MAX_ELEMENTS,
+    use_omniparser: bool = False,
 ) -> str:
     """Capture screenshot with labeled bounding boxes and an element list.
 
@@ -40,7 +43,17 @@ def observe(
       scale             -- uniform factor mapping image coords to pixel coords
     """
     b64, img_w, img_h, scale = capture_screenshot(target_width=width)
-    elements, backing_scale = get_accessibility_elements(max_elements=max_elements)
+
+    if use_omniparser:
+        backing_scale = _get_backing_scale()
+        elements = get_omniparser_elements(b64, img_w, img_h, scale, backing_scale)
+    else:
+        elements, backing_scale = get_accessibility_elements(max_elements=max_elements)
+        overlay_els = get_overlay_elements(elements)
+        if overlay_els:
+            elements = list(elements) + overlay_els
+            for i, el in enumerate(elements):
+                el.id = i
 
     labeled_b64 = draw_labels(
         b64, [el.to_dict() for el in elements], scale, backing_scale,

@@ -1,4 +1,9 @@
-"""Keyboard actions -- typing via clipboard, key press via pyautogui, hotkeys via CGEvent."""
+"""Keyboard actions via Quartz CGEvents with hardware-level event source.
+
+Typing uses clipboard (pbcopy + Cmd-V).  Key presses and hotkeys use
+CGEventCreateKeyboardEvent with CGEventSourceStateCombinedSessionState
+so they are indistinguishable from real hardware input.
+"""
 
 from __future__ import annotations
 
@@ -11,14 +16,20 @@ from Quartz import (
     CGEventCreateKeyboardEvent,
     CGEventPost,
     CGEventSetFlags,
+    CGEventSourceCreate,
     kCGEventFlagMaskCommand,
     kCGEventFlagMaskShift,
     kCGEventFlagMaskAlternate,
     kCGEventFlagMaskControl,
     kCGHIDEventTap,
+    kCGEventSourceStateCombinedSessionState,
 )
 
+from servers.action.mouse import click as mouse_click
+
 logger = logging.getLogger(__name__)
+
+_source = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState)
 
 # Virtual key codes (Carbon / HIToolbox)
 _KEY_CODE_MAP: dict[str, int] = {
@@ -55,6 +66,12 @@ _MODIFIER_MAP: dict[str, int] = {
 }
 
 
+def _post_key(key_code: int, down: bool, flags: int = 0) -> None:
+    event = CGEventCreateKeyboardEvent(_source, key_code, down)
+    CGEventSetFlags(event, flags)
+    CGEventPost(kCGHIDEventTap, event)
+
+
 def type_text(text: str, x: int | None = None, y: int | None = None, submit: bool = False) -> bool:
     """Type text via clipboard paste.
 
@@ -64,19 +81,18 @@ def type_text(text: str, x: int | None = None, y: int | None = None, submit: boo
     """
     try:
         if x is not None and y is not None:
-            pyautogui.moveTo(x, y, duration=0.3)
-            pyautogui.click()
+            mouse_click(x, y)
             time.sleep(0.3)
-            pyautogui.hotkey("command", "a")
+            hotkey(["command", "a"])
             time.sleep(0.1)
 
         subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
-        pyautogui.hotkey("command", "v")
+        hotkey(["command", "v"])
         time.sleep(0.2)
 
         if submit:
             time.sleep(0.1)
-            pyautogui.press("return")
+            press_key("return")
 
         where = f"at ({x}, {y})" if x is not None else "at cursor"
         logger.info("Typed '%s' %s%s", text, where, " + submit" if submit else "")
@@ -87,9 +103,15 @@ def type_text(text: str, x: int | None = None, y: int | None = None, submit: boo
 
 
 def press_key(key: str) -> bool:
-    """Press and release a single key via pyautogui."""
+    """Press and release a single key."""
+    code = _KEY_CODE_MAP.get(key.lower().strip())
+    if code is None:
+        logger.error("press_key: unknown key '%s'", key)
+        return False
     try:
-        pyautogui.press(key.lower().strip())
+        _post_key(code, True)
+        time.sleep(0.01)
+        _post_key(code, False)
         logger.debug("Pressed key: %s", key)
         return True
     except Exception as exc:
@@ -126,16 +148,9 @@ def hotkey(keys: list[str]) -> bool:
         return False
 
     try:
-        down = CGEventCreateKeyboardEvent(None, key_code, True)
-        if modifier_flags:
-            CGEventSetFlags(down, modifier_flags)
-        CGEventPost(kCGHIDEventTap, down)
-
-        up = CGEventCreateKeyboardEvent(None, key_code, False)
-        if modifier_flags:
-            CGEventSetFlags(up, modifier_flags)
-        CGEventPost(kCGHIDEventTap, up)
-
+        _post_key(key_code, True, modifier_flags)
+        time.sleep(0.01)
+        _post_key(key_code, False, modifier_flags)
         logger.debug("Sent hotkey: %s", "+".join(lower_keys))
         return True
     except Exception as exc:

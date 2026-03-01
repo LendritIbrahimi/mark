@@ -27,7 +27,7 @@ from agent.debug import (
 from agent.mcp_client import MCPClient
 from agent.state import StateManager
 from config import MarkConfig
-from llm.client import LLMClient
+from llm import create_llm_client
 from llm.prompts import build_step_message, build_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,25 @@ class StepResponse(BaseModel):
 AGENT_ACTIONS = {"wait", "done"}
 
 
+def _format_params(params: dict[str, Any]) -> str:
+    """Human-readable action params: wait(1s, "reason") instead of wait(seconds=1, reason='...')."""
+    if not params:
+        return ""
+    parts = []
+    for k, v in params.items():
+        if isinstance(v, str):
+            parts.append(f'"{v}"')
+        elif isinstance(v, list):
+            parts.append("+".join(str(i) for i in v))
+        elif isinstance(v, bool):
+            parts.append(str(v).lower())
+        elif isinstance(v, (int, float)):
+            parts.append(str(v))
+        else:
+            parts.append(repr(v))
+    return ", ".join(parts)
+
+
 class AgentLoop:
     """Autonomous macOS desktop automation agent."""
 
@@ -65,7 +84,7 @@ class AgentLoop:
         self.config = config
         self.vision = vision
         self.action = action
-        self.llm = LLMClient(config)
+        self.llm = create_llm_client(config)
         self.state = StateManager(
             goal=task,
             max_steps=config.max_steps,
@@ -77,27 +96,29 @@ class AgentLoop:
 
         self._done = False
         self._consecutive_failures = 0
+        self._screen_logged = False
         self._system_message = build_system_prompt()
         self._history: list[dict] = [self._system_message]
 
     async def run(self) -> str:
         """Run the perceive-think-act loop until done or limits reached."""
-        logger.info("Starting task: %s", self.task)
-        logger.info("Waiting %.1fs for application to load...", self.config.initial_delay)
-        await asyncio.sleep(self.config.initial_delay)
+        logger.debug("Task: %s", self.task)
+        if self.config.initial_delay:
+            logger.debug("Waiting %.1fs for application to load...", self.config.initial_delay)
+            await asyncio.sleep(self.config.initial_delay)
 
         for _ in range(self.config.max_steps):
             if self._done:
                 break
             if self._consecutive_failures >= self.config.max_failures:
-                logger.info("Too many consecutive failures (%d)", self._consecutive_failures)
+                logger.warning("Too many consecutive failures (%d), stopping.", self._consecutive_failures)
                 break
             await self._step()
 
         if self._done:
-            logger.info("Task completed successfully.")
+            logger.info("Done.")
         else:
-            logger.warning("Task did not complete within %d steps.", self.config.max_steps)
+            logger.warning("Did not complete within %d steps.", self.config.max_steps)
 
         remove_file_logger(self._log_handler)
         return self.state.recent_results[-1] if self.state.recent_results else "No result."
@@ -107,7 +128,6 @@ class AgentLoop:
         self.state.step += 1
         step = self.state.step
         await asyncio.sleep(self.config.step_delay)
-        logger.info("=== Step %d ===", step)
 
         step_dir = create_step_dir(self._session_dir, step)
         timings: dict[str, float] = {}
@@ -119,10 +139,22 @@ class AgentLoop:
             perception = await self.vision.call_tool("observe", {
                 "width": self.config.screenshot_width,
                 "max_elements": self.config.max_elements,
+                "use_omniparser": self.config.use_omniparser,
             }, timeout=self.config.mcp_timeout)
             timings["perceive_ms"] = (time.monotonic() - t0) * 1000
             self.state.update_ui(perception)
-            logger.info("Perceive: %.0fms (%d elements)", timings["perceive_ms"], len(self.state.element_positions))
+            logger.debug("Perceive: %.0fms (%d elements)", timings["perceive_ms"], len(self.state.element_positions))
+
+            if not self._screen_logged:
+                scale = perception.get("scale", 0)
+                if scale:
+                    real_w = int(self.config.screenshot_width * scale)
+                    logger.info(
+                        "Provider: %s | Model: %s | Max steps: %d | Screen: %dpx -> %dpx (scale %.2f)",
+                        self.config.provider, self.llm.model, self.config.max_steps,
+                        real_w, self.config.screenshot_width, scale,
+                    )
+                self._screen_logged = True
 
             self._save_screenshots(step_dir, perception)
 
@@ -130,7 +162,7 @@ class AgentLoop:
             t0 = time.monotonic()
             response = await self._think()
             timings["think_ms"] = (time.monotonic() - t0) * 1000
-            logger.info("Think: %.0fms", timings["think_ms"])
+            logger.debug("Think: %.0fms", timings["think_ms"])
 
             self._save_llm_debug(step_dir, response)
 
@@ -138,11 +170,13 @@ class AgentLoop:
                 self._write_trace(step_dir, None, [], timings, step_t0)
                 return
 
+            self._log_response(response, elapsed_s=timings["think_ms"] / 1000)
+
             # 3. ACT
             t0 = time.monotonic()
             results = await self._act(response)
             timings["act_ms"] = (time.monotonic() - t0) * 1000
-            logger.info("Act: %.0fms (%d actions)", timings["act_ms"], len(results))
+            logger.debug("Act: %.0fms (%d actions)", timings["act_ms"], len(results))
 
             await asyncio.sleep(self.config.post_action_delay)
 
@@ -151,11 +185,12 @@ class AgentLoop:
 
         except Exception as exc:
             self._consecutive_failures += 1
-            logger.error("Step %d error (%d/%d): %s", step, self._consecutive_failures, self.config.max_failures, exc)
+            logger.error("Step %d failed: %s", step, exc)
             self.state.record_result(f"Step error: {exc}")
 
     async def _think(self) -> StepResponse | None:
         """Build messages and call the LLM."""
+        self._last_think_error: str | None = None
         step_msg = build_step_message(self.state)
 
         self._history.append(step_msg)
@@ -165,10 +200,9 @@ class AgentLoop:
             response = await self.llm.decide(
                 self._history,
                 StepResponse,
-                image_b64=self.state.image_b64 or None,
+                image_b64=self.state.image_b64 if self.config.send_images else None,
             )
             response.actions = response.actions[:self.config.max_actions_per_step]
-            self._log_response(response)
             self._history.append({
                 "role": "assistant",
                 "content": response.model_dump_json(),
@@ -176,7 +210,9 @@ class AgentLoop:
             return response
 
         except Exception as exc:
-            logger.error("LLM call failed: %s", exc)
+            self._history.pop()  # remove the user message to avoid consecutive user turns
+            self._last_think_error = f"{type(exc).__name__}: {exc}"
+            logger.error("LLM call failed: %s", self._last_think_error)
             self._consecutive_failures += 1
             self.state.record_result(f"LLM error: {exc}")
             return None
@@ -222,14 +258,11 @@ class AgentLoop:
         # Agent-level actions
         if name == "wait":
             seconds = max(0.5, min(float(params.get("seconds", 1)), 10.0))
-            reason = params.get("reason", "")
-            logger.info("Waiting %.1fs%s", seconds, f" ({reason})" if reason else "")
             await asyncio.sleep(seconds)
             return {"success": True, "message": f"Waited {seconds:.1f}s"}
 
         if name == "done":
             text = params.get("text", "Task complete")
-            logger.info("Task done: %s", text[:200])
             return {"success": True, "message": text, "is_done": True}
 
         # Resolve element_id to coordinates for MCP actions
@@ -260,7 +293,7 @@ class AgentLoop:
         return {"success": True, "message": str(raw)}
 
     def _resolve_params(self, action_name: str, params: dict) -> dict:
-        """Resolve element_id references or convert raw image-space coords to point-space."""
+        """Resolve element_id references to point-space coordinates."""
         resolved = dict(params)
 
         if "element_id" in resolved:
@@ -270,8 +303,6 @@ class AgentLoop:
                 raise ValueError(f"Element {eid} not found (total={len(self.state.element_positions)})")
             resolved["x"] = coords[0]
             resolved["y"] = coords[1]
-        elif "x" in resolved and "y" in resolved:
-            resolved["x"], resolved["y"] = self._image_to_point(resolved["x"], resolved["y"])
 
         if "from_element_id" in resolved:
             eid = resolved.pop("from_element_id")
@@ -280,8 +311,6 @@ class AgentLoop:
                 raise ValueError(f"From-element {eid} not found")
             resolved["from_x"] = coords[0]
             resolved["from_y"] = coords[1]
-        elif "from_x" in resolved and "from_y" in resolved:
-            resolved["from_x"], resolved["from_y"] = self._image_to_point(resolved["from_x"], resolved["from_y"])
 
         if "to_element_id" in resolved:
             eid = resolved.pop("to_element_id")
@@ -290,15 +319,8 @@ class AgentLoop:
                 raise ValueError(f"To-element {eid} not found")
             resolved["to_x"] = coords[0]
             resolved["to_y"] = coords[1]
-        elif "to_x" in resolved and "to_y" in resolved:
-            resolved["to_x"], resolved["to_y"] = self._image_to_point(resolved["to_x"], resolved["to_y"])
 
         return resolved
-
-    def _image_to_point(self, x: int | float, y: int | float) -> tuple[int, int]:
-        """Convert image-space coordinates to macOS point-space for pyautogui."""
-        factor = self.state.scale / self.state.backing_scale
-        return int(x * factor), int(y * factor)
 
     # -- Helpers --
 
@@ -335,18 +357,27 @@ class AgentLoop:
         with open(os.path.join(step_dir, "llm_messages.json"), "w", encoding="utf-8") as f:
             json.dump({
                 "step": self.state.step,
-                "model": self.config.model,
+                "model": self.llm.model,
                 "image_attached": bool(self.state.image_b64),
                 "message_count": len(messages_log),
                 "messages": messages_log,
             }, f, indent=2, default=str)
 
+        raw_path = os.path.join(step_dir, "llm_raw_response.txt")
+        with open(raw_path, "w", encoding="utf-8") as f:
+            f.write(self.llm.last_raw_response or "(no response captured)")
+
         response_path = os.path.join(step_dir, "llm_response.json")
+        if response:
+            payload = response.model_dump()
+        else:
+            payload = {
+                "error": "LLM call failed",
+                "reason": getattr(self, "_last_think_error", None) or "unknown",
+                "raw_response": self.llm.last_raw_response or None,
+            }
         with open(response_path, "w", encoding="utf-8") as f:
-            json.dump(
-                response.model_dump() if response else {"error": "LLM call failed"},
-                f, indent=2, default=str,
-            )
+            json.dump(payload, f, indent=2, default=str)
 
     def _write_trace(
         self,
@@ -369,8 +400,9 @@ class AgentLoop:
         }
         write_step_trace(step_dir, trace)
 
-    @staticmethod
-    def _log_response(response: StepResponse) -> None:
-        logger.info("Thought: %s", response.thought[:200])
-        for i, a in enumerate(response.actions):
-            logger.info("  Action %d: %s(%s)", i + 1, a.name, a.params)
+    def _log_response(self, response: StepResponse, elapsed_s: float = 0) -> None:
+        step = self.state.step
+        header = f"[Step {step} \u2014 {elapsed_s:.1f}s]" if elapsed_s else f"[Step {step}]"
+        logger.info("%s %s", header, response.thought)
+        for a in response.actions:
+            logger.info("  \u2192 %s(%s)", a.name, _format_params(a.params))
