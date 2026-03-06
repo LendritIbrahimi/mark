@@ -11,10 +11,9 @@ NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPo
 from fastmcp import FastMCP
 
 from servers.vision.screenshot import capture_screenshot
-from servers.vision.accessibility import get_accessibility_elements, _get_backing_scale
+from servers.vision.accessibility import get_accessibility_elements
 from servers.vision.labeler import draw_labels
 from servers.vision.overlay import get_overlay_elements
-from servers.vision.omniparser import get_omniparser_elements
 
 import os as _os
 
@@ -32,7 +31,6 @@ MAX_ELEMENTS = 150
 def observe(
     width: int = SCREENSHOT_WIDTH,
     max_elements: int = MAX_ELEMENTS,
-    use_omniparser: bool = False,
 ) -> str:
     """Capture screenshot with labeled bounding boxes and an element list.
 
@@ -44,24 +42,28 @@ def observe(
     """
     b64, img_w, img_h, scale = capture_screenshot(target_width=width)
 
-    if use_omniparser:
-        backing_scale = _get_backing_scale()
-        elements = get_omniparser_elements(b64, img_w, img_h, scale, backing_scale)
-    else:
-        elements, backing_scale = get_accessibility_elements(max_elements=max_elements)
-        overlay_els = get_overlay_elements(elements)
-        if overlay_els:
-            elements = list(elements) + overlay_els
-            for i, el in enumerate(elements):
-                el.id = i
+    elements, backing_scale = get_accessibility_elements(max_elements=max_elements)
+
+    overlay_els = get_overlay_elements(elements)
+    if overlay_els:
+        elements = list(elements) + overlay_els
+        for i, el in enumerate(elements):
+            el.id = i
 
     labeled_b64 = draw_labels(
         b64, [el.to_dict() for el in elements], scale, backing_scale,
     )
 
+    min_depth = min((el.depth for el in elements), default=0)
+    max_indent = 3
+    element_lines = [
+        el.format_entry(indent=min(el.depth - min_depth, max_indent))
+        for el in elements
+    ]
+
     return json.dumps({
         "image": labeled_b64,
-        "elements": "\n".join(el.format_entry() for el in elements),
+        "elements": "\n".join(element_lines),
         "element_positions": [el.to_position() for el in elements],
         "scale": scale,
         "backing_scale": backing_scale,

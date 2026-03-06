@@ -1,6 +1,6 @@
 """Agent loop -- the main perceive-think-act cycle.
 
-Connects to Vision and Action MCP servers, calls GPT-4o-mini for decisions,
+Connects to Vision and Action MCP servers, calls the configured LLM for decisions,
 and executes actions until the task is complete or limits are reached.
 """
 
@@ -26,9 +26,9 @@ from agent.debug import (
 )
 from agent.mcp_client import MCPClient
 from agent.state import StateManager
+from agent.llm import OpenAILLM
+from agent.prompts import build_goal_self_summary_messages, build_step_message, build_system_prompt
 from config import MarkConfig
-from llm import create_llm_client
-from llm.prompts import build_step_message, build_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +46,63 @@ class StepResponse(BaseModel):
     actions: list[ActionCall] = Field(min_length=1)
 
 
-# -- Agent-level actions (not routed to MCP) --
+class GoalSummary(BaseModel):
+    result: str
 
-AGENT_ACTIONS = {"wait", "done"}
+
+# -- Action registry: single source of truth for agent ↔ MCP mapping --
+# (agent_name, mcp_tool, agent_params, group)
+
+_ACTION_REGISTRY: list[tuple[str, str, str, str]] = [
+    ("click",        "click",        "element_id",                      "Mouse"),
+    ("double_click", "double_click", "element_id",                      "Mouse"),
+    ("right_click",  "right_click",  "element_id",                      "Mouse"),
+    ("hover",        "hover_at",     "element_id",                      "Mouse"),
+    ("drag",         "drag_to",      "from_element_id, to_element_id",  "Mouse"),
+    ("scroll",       "scroll_at",    "direction, amount",               "Mouse"),
+    ("type_text",    "type_text",    "text, element_id?, submit?",      "Keyboard"),
+    ("press_key",    "press_key",    "key",                             "Keyboard"),
+    ("hotkey",       "hotkey_press", "keys",                            "Keyboard"),
+    ("wait",         "wait",         "seconds",                         "Control"),
+    ("done",         "done",         "text",                            "Control"),
+]
+
+_TOOL_MAP: dict[str, str] = {name: mcp for name, mcp, _, _ in _ACTION_REGISTRY}
+_VALID_PARAMS: dict[str, set[str]] = {
+    name: {p.strip().rstrip("?") for p in params.split(",")}
+    for name, _, params, _ in _ACTION_REGISTRY
+}
+
+
+_LOCAL_ACTION_DOCS: dict[str, str] = {
+    "wait": "Pause 0.5-10 seconds for loading or when unsure what to do",
+    "done": "Mark task complete with a result description",
+}
+
+
+def _build_action_docs(action_mcp: MCPClient) -> str:
+    """Generate action documentation from MCP tool schemas + the agent's parameter mapping."""
+    schemas = action_mcp.tool_schemas
+    groups: dict[str, list[str]] = {}
+
+    for agent_name, mcp_name, params, group in _ACTION_REGISTRY:
+        desc = (schemas.get(mcp_name, {}).get("description", "")
+                or _LOCAL_ACTION_DOCS.get(agent_name, ""))
+        line = f"- {agent_name}({params}) -- {desc}"
+        groups.setdefault(group, []).append(line)
+
+    parts: list[str] = []
+    for group_name in ("Mouse", "Keyboard", "Control"):
+        if group_name in groups:
+            parts.append(f"{group_name}:")
+            parts.extend(groups[group_name])
+            parts.append("")
+
+    return "\n".join(parts).rstrip()
 
 
 def _format_params(params: dict[str, Any]) -> str:
-    """Human-readable action params: wait(1s, "reason") instead of wait(seconds=1, reason='...')."""
+    """Human-readable action params: wait(1s) instead of wait(seconds=1)."""
     if not params:
         return ""
     parts = []
@@ -84,7 +134,7 @@ class AgentLoop:
         self.config = config
         self.vision = vision
         self.action = action
-        self.llm = create_llm_client(config)
+        self.llm = OpenAILLM(config)
         self.state = StateManager(
             goal=task,
             max_steps=config.max_steps,
@@ -97,11 +147,17 @@ class AgentLoop:
         self._done = False
         self._consecutive_failures = 0
         self._screen_logged = False
-        self._system_message = build_system_prompt()
+        self._system_message = build_system_prompt(
+            action_docs=_build_action_docs(action),
+        )
         self._history: list[dict] = [self._system_message]
 
+    @property
+    def session_dir(self) -> str:
+        return self._session_dir
+
     async def run(self) -> str:
-        """Run the perceive-think-act loop until done or limits reached."""
+        """Run the perceive-think-act loop and return an LLM summary of the goal."""
         logger.debug("Task: %s", self.task)
         if self.config.initial_delay:
             logger.debug("Waiting %.1fs for application to load...", self.config.initial_delay)
@@ -120,8 +176,23 @@ class AgentLoop:
         else:
             logger.warning("Did not complete within %d steps.", self.config.max_steps)
 
+        result = await self._summarize_goal()
+        logger.info("Goal result: %s", result)
+
         remove_file_logger(self._log_handler)
-        return self.state.recent_results[-1] if self.state.recent_results else "No result."
+        return result
+
+    async def _summarize_goal(self) -> str:
+        """Call the LLM to produce a self-contained summary of what this goal accomplished."""
+        if not self.state.recent_results:
+            return "No actions were taken."
+        messages = build_goal_self_summary_messages(self.task, list(self.state.recent_results))
+        try:
+            response = await self.llm.decide(messages, GoalSummary)
+            return response.result
+        except Exception as exc:
+            logger.warning("Goal summary LLM call failed: %s", exc)
+            return self.state.recent_results[-1]
 
     async def _step(self) -> None:
         """Execute one perceive -> think -> act cycle."""
@@ -139,7 +210,6 @@ class AgentLoop:
             perception = await self.vision.call_tool("observe", {
                 "width": self.config.screenshot_width,
                 "max_elements": self.config.max_elements,
-                "use_omniparser": self.config.use_omniparser,
             }, timeout=self.config.mcp_timeout)
             timings["perceive_ms"] = (time.monotonic() - t0) * 1000
             self.state.update_ui(perception)
@@ -150,8 +220,8 @@ class AgentLoop:
                 if scale:
                     real_w = int(self.config.screenshot_width * scale)
                     logger.info(
-                        "Provider: %s | Model: %s | Max steps: %d | Screen: %dpx -> %dpx (scale %.2f)",
-                        self.config.provider, self.llm.model, self.config.max_steps,
+                        "Model: %s | Max steps: %d | Screen: %dpx -> %dpx (scale %.2f)",
+                        self.llm.model, self.config.max_steps,
                         real_w, self.config.screenshot_width, scale,
                     )
                 self._screen_logged = True
@@ -196,9 +266,11 @@ class AgentLoop:
         self._history.append(step_msg)
         self._trim_history()
 
+        compressed = self._compress_history()
+
         try:
             response = await self.llm.decide(
-                self._history,
+                compressed,
                 StepResponse,
                 image_b64=self.state.image_b64 if self.config.send_images else None,
             )
@@ -207,13 +279,15 @@ class AgentLoop:
                 "role": "assistant",
                 "content": response.model_dump_json(),
             })
+            self.state.record_empty_response(success=True)
             return response
 
         except Exception as exc:
-            self._history.pop()  # remove the user message to avoid consecutive user turns
+            self._history.pop()
             self._last_think_error = f"{type(exc).__name__}: {exc}"
             logger.error("LLM call failed: %s", self._last_think_error)
             self._consecutive_failures += 1
+            self.state.record_empty_response(success=False)
             self.state.record_result(f"LLM error: {exc}")
             return None
 
@@ -255,7 +329,6 @@ class AgentLoop:
 
     async def _execute_action(self, name: str, params: dict) -> dict:
         """Route an action to the appropriate handler."""
-        # Agent-level actions
         if name == "wait":
             seconds = max(0.5, min(float(params.get("seconds", 1)), 10.0))
             await asyncio.sleep(seconds)
@@ -265,23 +338,16 @@ class AgentLoop:
             text = params.get("text", "Task complete")
             return {"success": True, "message": text, "is_done": True}
 
-        # Resolve element_id to coordinates for MCP actions
+        valid = _VALID_PARAMS.get(name)
+        if valid is not None:
+            extra = set(params) - valid
+            if extra:
+                logger.debug("Stripping unexpected params from %s: %s", name, extra)
+                params = {k: v for k, v in params.items() if k in valid}
+
         resolved_params = self._resolve_params(name, params)
 
-        # Map agent action names to MCP tool names
-        tool_map = {
-            "click": "click",
-            "double_click": "double_click",
-            "right_click": "right_click",
-            "hover": "hover_at",
-            "drag": "drag_to",
-            "scroll": "scroll_at",
-            "type_text": "type_text",
-            "press_key": "press_key",
-            "hotkey": "hotkey_press",
-        }
-
-        tool_name = tool_map.get(name)
+        tool_name = _TOOL_MAP.get(name)
         if tool_name is None:
             return {"success": False, "message": f"Unknown action: {name}"}
 
@@ -324,6 +390,32 @@ class AgentLoop:
 
     # -- Helpers --
 
+    @staticmethod
+    def _summarize_elements(content: str) -> str:
+        """Replace the element block in a user message with a short count."""
+        marker = "\nScreen elements:\n"
+        idx = content.find(marker)
+        if idx != -1:
+            elem_text = content[idx + len(marker):]
+            count = sum(1 for line in elem_text.splitlines() if line.strip())
+            return content[:idx] + f"\nprevious elements on the screen: {count}"
+        if "\nNo elements detected on screen." in content:
+            return content.split("\nNo elements detected on screen.")[0] + "\nprevious elements on the screen: 0"
+        return content
+
+    def _compress_history(self) -> list[dict]:
+        """Return a copy of _history with element lists summarized except for the current user message."""
+        user_indices = [i for i, m in enumerate(self._history) if m.get("role") == "user"]
+        keep_full = set(user_indices[-1:])
+
+        compressed: list[dict] = []
+        for i, msg in enumerate(self._history):
+            if msg.get("role") == "user" and i not in keep_full:
+                compressed.append({"role": "user", "content": self._summarize_elements(msg["content"])})
+            else:
+                compressed.append(msg)
+        return compressed
+
     def _trim_history(self) -> None:
         """Keep conversation history within limits (preserve system message)."""
         max_msg = self.config.max_messages
@@ -343,16 +435,18 @@ class AgentLoop:
         """Save full LLM inputs/outputs for step-level debugging.
 
         Files written:
-          elements.txt       -- element list the LLM saw
-          llm_messages.json  -- full conversation history (text only)
-          llm_response.json  -- structured LLM decision
+          elements.txt              -- element list the LLM saw
+          llm_messages.json         -- full conversation history (text only)
+          llm_response.json         -- structured LLM decision
+          llm_raw_response.txt      -- raw LLM output string
+          llm_response_metadata.json -- full LLM HTTP response metadata
         """
         with open(os.path.join(step_dir, "elements.txt"), "w", encoding="utf-8") as f:
             f.write(self.state.elements or "No elements detected")
 
         messages_log = [
             {"role": m["role"], "content": m.get("content", "")}
-            for m in self._history
+            for m in self._compress_history()
         ]
         with open(os.path.join(step_dir, "llm_messages.json"), "w", encoding="utf-8") as f:
             json.dump({
@@ -366,6 +460,11 @@ class AgentLoop:
         raw_path = os.path.join(step_dir, "llm_raw_response.txt")
         with open(raw_path, "w", encoding="utf-8") as f:
             f.write(self.llm.last_raw_response or "(no response captured)")
+
+        if self.llm.last_response_metadata:
+            meta_path = os.path.join(step_dir, "llm_response_metadata.json")
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(self.llm.last_response_metadata, f, indent=2, default=str)
 
         response_path = os.path.join(step_dir, "llm_response.json")
         if response:
@@ -402,7 +501,8 @@ class AgentLoop:
 
     def _log_response(self, response: StepResponse, elapsed_s: float = 0) -> None:
         step = self.state.step
-        header = f"[Step {step} \u2014 {elapsed_s:.1f}s]" if elapsed_s else f"[Step {step}]"
+        calls = f"({self.llm.successful_calls}/{self.llm.total_calls})"
+        header = f"[Step {step} \u2014 {elapsed_s:.1f}s] {calls}" if elapsed_s else f"[Step {step}] {calls}"
         logger.info("%s %s", header, response.thought)
         for a in response.actions:
             logger.info("  \u2192 %s(%s)", a.name, _format_params(a.params))

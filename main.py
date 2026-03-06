@@ -18,15 +18,19 @@ load_dotenv()
 
 from agent.loop import AgentLoop
 from agent.mcp_client import connect_mcp
+from agent.orchestrator import Orchestrator
 from config import MarkConfig
 
 
-async def run_agent(task: str, config: MarkConfig) -> None:
+async def run_agent(task: str, config: MarkConfig, *, use_orchestrator: bool = True) -> None:
     """Start MCP servers and run the agent loop."""
     async with connect_mcp("vision", sys.executable, ["-m", "servers.vision.server"]) as vision:
         async with connect_mcp("action", sys.executable, ["-m", "servers.action.server"]) as action:
-            agent = AgentLoop(task, config, vision, action)
-            result = await agent.run()
+            if use_orchestrator:
+                runner = Orchestrator(task, config, vision, action)
+            else:
+                runner = AgentLoop(task, config, vision, action)
+            result = await runner.run()
             print(f"\nResult: {result}")
 
 
@@ -36,13 +40,8 @@ def main() -> None:
     )
     parser.add_argument("task", help="Natural-language task to accomplish")
     parser.add_argument(
-        "--provider", default="openai",
-        choices=["openai", "gemini", "ollama"],
-        help="LLM provider (default: openai)",
-    )
-    parser.add_argument(
         "--model", default=None,
-        help="Model name (default: provider-specific)",
+        help="LLM model name (default: o4-mini)",
     )
     parser.add_argument(
         "--max-steps", type=int, default=100,
@@ -57,8 +56,13 @@ def main() -> None:
         help="Don't send screenshots to the LLM (element list only)",
     )
     parser.add_argument(
-        "--omniparser", action="store_true",
-        help="Use OmniParser v2 for element detection instead of accessibility tree",
+        "--reasoning-effort", default="medium",
+        choices=["low", "medium", "high"],
+        help="Reasoning effort for o-series models (default: medium)",
+    )
+    parser.add_argument(
+        "--no-orchestrator", action="store_true",
+        help="Run as a single agent loop without goal decomposition",
     )
     parser.add_argument(
         "--verbose", action="store_true",
@@ -80,29 +84,26 @@ def main() -> None:
         logging.basicConfig(level=logging.INFO, handlers=[handler])
         os.environ["MARK_LOG_LEVEL"] = "WARNING"
 
-    for noisy in ("httpx", "httpcore", "openai", "google", "google_genai", "ollama", "mcp"):
+    for noisy in ("httpx", "httpcore", "openai", "mcp"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    default_models = {
-        "openai": "gpt-4o-mini",
-        "gemini": "gemini-2.0-flash",
-        "ollama": "llama3.2-vision",
-    }
-    model = args.model or default_models.get(args.provider, "gpt-4o-mini")
-
     config = MarkConfig(
-        provider=args.provider,
-        model=model,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
         max_steps=args.max_steps,
         screenshot_width=args.screenshot_width,
         send_images=not args.no_vision,
-        use_omniparser=args.omniparser,
     )
 
+    use_orchestrator = not args.no_orchestrator
     print(f"Task: {args.task}")
+    if use_orchestrator:
+        print("Mode: orchestrator (goal decomposition)")
+    else:
+        print("Mode: single agent loop")
 
     try:
-        asyncio.run(run_agent(args.task, config))
+        asyncio.run(run_agent(args.task, config, use_orchestrator=use_orchestrator))
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
         sys.exit(130)

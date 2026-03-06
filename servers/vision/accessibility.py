@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ApplicationServices import (
+    AXUIElementCopyActionNames,
     AXUIElementCreateApplication,
     AXUIElementCreateSystemWide,
     AXUIElementCopyAttributeValue,
@@ -38,6 +39,7 @@ INTERACTABLE_ROLES = {
     "AXTab", "AXImage", "AXStaticText", "AXIncrementor",
     "AXHeading", "AXDockItem", "AXMenuBarItem",
     "AXSheet", "AXDialog",
+    "AXDisclosureTriangle", "AXCell",
 }
 
 ROLE_DISPLAY_NAMES: dict[str, str] = {
@@ -61,9 +63,35 @@ ROLE_DISPLAY_NAMES: dict[str, str] = {
     "AXDockItem": "DockItem",
     "AXSheet": "Dialog",
     "AXDialog": "Dialog",
+    "AXDisclosureTriangle": "Toggle",
+    "AXCell": "Cell",
 }
 
 _DIALOG_ROLES = {"AXSheet", "AXDialog"}
+
+# ---------------------------------------------------------------------------
+# Interactivity classification
+# ---------------------------------------------------------------------------
+
+_ACTION_REQUIRED_ROLES = {"AXStaticText"}
+
+_CLICKABLE_ACTIONS = {
+    "AXPress", "AXIncrement", "AXDecrement",
+    "AXConfirm", "AXCancel", "AXRaise", "AXSetValue",
+}
+
+_TEXT_ROLES = {"AXTextField", "AXTextArea"}
+
+_SUBROLE_DISPLAY: dict[str, str] = {
+    "AXSearchField": "SearchField",
+    "AXSecureTextField": "PasswordField",
+    "AXCloseButton": "CloseButton",
+    "AXMinimizeButton": "MinButton",
+    "AXZoomButton": "ZoomButton",
+    "AXFullScreenButton": "FullScreenButton",
+    "AXToolbarButton": "ToolbarButton",
+    "AXSortButton": "SortButton",
+}
 
 # ---------------------------------------------------------------------------
 # Screen helpers
@@ -101,6 +129,17 @@ def _ax_attr(element: Any, attr: str) -> Any:
     return value if err == kAXErrorSuccess else None
 
 
+def _ax_actions(element: Any) -> list[str]:
+    """Return the list of AX actions supported by this element."""
+    try:
+        err, actions = AXUIElementCopyActionNames(element, None)
+        if err == kAXErrorSuccess and actions:
+            return list(actions)
+    except Exception:
+        pass
+    return []
+
+
 def _ax_position(element: Any) -> tuple[int, int] | None:
     """Extract point-space position (x, y) from an AX element."""
     pos_val = _ax_attr(element, "AXPosition")
@@ -125,11 +164,27 @@ def _ax_size(element: Any) -> tuple[int, int] | None:
         return None
 
 
-def _build_label(element: Any) -> str:
+_GENERIC_ROLE_DESCRIPTIONS = {
+    v.lower() for v in ROLE_DISPLAY_NAMES.values()
+} | {
+    "text", "button", "image", "link", "checkbox", "radio button",
+    "pop up button", "combo box", "slider", "menu item", "menu bar item",
+    "tab", "stepper", "heading", "text field", "text area", "group",
+}
+
+
+_CONTAINER_ROLES = {"AXCell", "AXGroup"}
+
+
+def _build_label(element: Any, role: str = "") -> str:
     """Build a human-readable label from available AX attributes.
 
-    Intentionally excludes AXRoleDescription -- it returns generic strings
-    like "search text field" for hidden system elements, producing phantom labels.
+    Fallback order:
+      1. AXTitle, AXDescription, AXValue
+      2. AXPlaceholderValue (text inputs only)
+      3. AXHelp (tooltip / help text)
+      4. AXRoleDescription (last resort, skip generic strings like "button")
+      5. First child AXStaticText value (for containers like AXCell)
     """
     for attr in ("AXTitle", "AXDescription", "AXValue"):
         val = _ax_attr(element, attr)
@@ -138,12 +193,50 @@ def _build_label(element: Any) -> str:
         text = str(val).strip()
         if not text:
             continue
-        try:
-            float(text)
-            continue
-        except ValueError:
-            pass
+        if role not in _TEXT_ROLES:
+            try:
+                float(text)
+                continue
+            except ValueError:
+                pass
         return text[:80]
+    if role in _TEXT_ROLES:
+        ph = _ax_attr(element, "AXPlaceholderValue")
+        if ph:
+            text = str(ph).strip()
+            if text:
+                return text[:80]
+    help_val = _ax_attr(element, "AXHelp")
+    if help_val:
+        text = str(help_val).strip()
+        if text:
+            return text[:80]
+    rd = _ax_attr(element, "AXRoleDescription")
+    if rd:
+        text = str(rd).strip()
+        if text and text.lower() not in _GENERIC_ROLE_DESCRIPTIONS:
+            return text[:80]
+    if role in _CONTAINER_ROLES:
+        text = _label_from_children(element)
+        if text:
+            return text
+    return ""
+
+
+def _label_from_children(element: Any) -> str:
+    """Get label from the first AXStaticText child -- mimics VoiceOver behavior."""
+    children = _ax_attr(element, "AXChildren")
+    if not children:
+        return ""
+    for child in children[:5]:
+        cr = _ax_attr(child, "AXRole") or ""
+        if cr == "AXStaticText":
+            for attr in ("AXValue", "AXTitle", "AXDescription"):
+                val = _ax_attr(child, attr)
+                if val:
+                    text = str(val).strip()
+                    if text:
+                        return text[:80]
     return ""
 
 
@@ -161,6 +254,10 @@ def _collect_states(element: Any, role: str) -> list[str]:
         states.append("CHECKED")
     if _ax_attr(element, "AXExpanded"):
         states.append("EXPANDED")
+    if _ax_attr(element, "AXRequired"):
+        states.append("REQUIRED")
+    if role == "AXLink" and _ax_attr(element, "AXVisited"):
+        states.append("VISITED")
     return states
 
 
@@ -177,31 +274,66 @@ def _walk_tree(
     max_elements: int,
     depth: int = 0,
     max_depth: int = 15,
+    path: str = "",
 ) -> None:
-    """Recursively walk the AX tree collecting interactable elements."""
+    """Recursively walk the AX tree collecting interactive elements.
+
+    Roles in ``_ACTION_REQUIRED_ROLES`` (e.g. AXStaticText) are only
+    collected when they support a clickable action like AXPress, avoiding
+    noise from display-only labels.
+    """
     if len(results) >= max_elements or depth > max_depth:
         return
 
     role = _ax_attr(element, "AXRole") or ""
 
+    should_collect = False
     if role in INTERACTABLE_ROLES:
+        if role in _ACTION_REQUIRED_ROLES:
+            actions = _ax_actions(element)
+            should_collect = bool(_CLICKABLE_ACTIONS.intersection(actions))
+        else:
+            should_collect = True
+
+    if should_collect:
         pos = _ax_position(element)
         size = _ax_size(element)
         if pos and size and size[0] >= _MIN_SIZE and size[1] >= _MIN_SIZE:
             results.append({
                 "role": str(role),
-                "label": _build_label(element),
+                "subrole": str(_ax_attr(element, "AXSubrole") or ""),
+                "label": _build_label(element, role=role),
                 "x": pos[0], "y": pos[1],
                 "w": size[0], "h": size[1],
                 "states": _collect_states(element, role),
+                "path": path,
+                "depth": depth,
             })
 
     children = _ax_attr(element, "AXChildren")
     if children:
-        for child in children:
+        child_list = list(children)
+
+        role_counts: dict[str, int] = {}
+        child_roles: list[str] = []
+        for child in child_list:
+            cr = _ax_attr(child, "AXRole") or ""
+            child_roles.append(cr)
+            role_counts[cr] = role_counts.get(cr, 0) + 1
+
+        role_indices: dict[str, int] = {}
+        for child, cr in zip(child_list, child_roles):
             if len(results) >= max_elements:
                 break
-            _walk_tree(child, results, max_elements, depth + 1, max_depth)
+            idx = role_indices.get(cr, 0)
+            role_indices[cr] = idx + 1
+            component = f"{cr}[{idx}]" if role_counts[cr] > 1 else cr
+            child_path = f"{path}/{component}" if path else component
+            child_max_depth = depth + 25 if cr == "AXWebArea" else max_depth
+            _walk_tree(
+                child, results, max_elements,
+                depth + 1, child_max_depth, path=child_path,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +343,11 @@ def _walk_tree(
 
 @dataclass
 class UIElement:
-    """A single interactable UI element with point-space coordinates."""
+    """A single interactive UI element with point-space coordinates.
+
+    Each element has a numeric *id* used for labeling on the screenshot
+    and as the target for agent actions (click, type_text, etc.).
+    """
 
     id: int
     role: str
@@ -222,6 +358,9 @@ class UIElement:
     h: int
     states: list[str]
     source: str = ""
+    subrole: str = ""
+    path: str = ""
+    depth: int = 0
 
     @property
     def center(self) -> tuple[int, int]:
@@ -229,6 +368,8 @@ class UIElement:
 
     @property
     def display_role(self) -> str:
+        if self.subrole in _SUBROLE_DISPLAY:
+            return _SUBROLE_DISPLAY[self.subrole]
         return ROLE_DISPLAY_NAMES.get(self.role, self.role.replace("AX", ""))
 
     def to_dict(self) -> dict:
@@ -243,16 +384,20 @@ class UIElement:
         cx, cy = self.center
         return {"id": self.id, "x": cx, "y": cy}
 
-    def format_entry(self) -> str:
-        """e.g. [3] [FOCUSED] (Safari) Button: \"Submit\" """
-        tags = " ".join(f"[{s}]" for s in self.states)
+    def format_entry(self, indent: int = 0) -> str:
+        """Format for the agent's text element list.
+
+        Example: ``[3] [FOCUSED] Button: "Submit"``
+        """
+        prefix = "  " * indent
         parts = [f"[{self.id}]"]
+        tags = " ".join(f"[{s}]" for s in self.states)
         if tags:
             parts.append(tags)
         if self.source:
             parts.append(f"({self.source})")
         parts.append(f'{self.display_role}: "{self.label}"' if self.label else self.display_role)
-        return " ".join(parts)
+        return prefix + " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -463,18 +608,33 @@ def get_accessibility_elements(
 
     bg_pids = _get_visible_app_pids(exclude_pids, onscreen_windows)
 
-    if bg_pids:
-        bg_budget = max(20, (raw_limit - len(app_raw)) // len(bg_pids))
-        for bg_pid, bg_name in bg_pids:
-            bg_raw: list[dict] = []
-            bg_ref = AXUIElementCreateApplication(bg_pid)
-            _walk_tree(bg_ref, bg_raw, bg_budget)
-            for item in bg_raw:
-                item["source"] = bg_name
-                item["pid"] = bg_pid
-            app_raw.extend(bg_raw)
-            if bg_raw:
-                logger.debug("BG app %s (PID %d): %d elements", bg_name, bg_pid, len(bg_raw))
+    for bg_pid, bg_name in bg_pids:
+        bg_ref = AXUIElementCreateApplication(bg_pid)
+        windows = _ax_attr(bg_ref, "AXWindows")
+        if not windows:
+            continue
+        count = 0
+        for win in windows:
+            pos = _ax_position(win)
+            size = _ax_size(win)
+            if not pos or not size or size[0] < _MIN_SIZE or size[1] < _MIN_SIZE:
+                continue
+            label = _build_label(win)
+            app_raw.append({
+                "role": "AXWindow",
+                "subrole": str(_ax_attr(win, "AXSubrole") or ""),
+                "label": label,
+                "x": pos[0], "y": pos[1],
+                "w": size[0], "h": size[1],
+                "states": _collect_states(win, "AXWindow"),
+                "path": "AXWindow",
+                "depth": 0,
+                "source": bg_name,
+                "pid": bg_pid,
+            })
+            count += 1
+        if count:
+            logger.debug("BG app %s (PID %d): %d window(s)", bg_name, bg_pid, count)
 
     # -- Dock --
 
@@ -515,16 +675,20 @@ def get_accessibility_elements(
         seen.add(key)
 
         visible.append(UIElement(
-            id=len(visible), role=item["role"], label=item["label"],
+            id=len(visible),
+            role=item["role"], label=item["label"],
             x=x, y=y, w=w, h=h,
             states=item.get("states", []),
             source=item.get("source", ""),
+            subrole=item.get("subrole", ""),
+            path=item.get("path", ""),
+            depth=item.get("depth", 0),
         ))
 
     visible = visible[:max_elements]
 
     logger.debug(
-        "Total: %d visible (%d off-screen, %d dupes, %d occluded, backing_scale=%.1f)",
-        len(visible), skipped, dupes, occluded, backing_scale,
+        "Total: %d visible (%d off-screen, %d dupes, %d occluded)",
+        len(visible), skipped, dupes, occluded,
     )
     return visible, backing_scale

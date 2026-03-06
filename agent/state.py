@@ -29,6 +29,7 @@ class StateManager:
     _recent_failed: list[str] = field(default_factory=list)
     _recent_all: list[str] = field(default_factory=list)
     _prev_element_count: int = -1
+    _consecutive_empty: int = 0
 
     def update_ui(self, perception: dict) -> None:
         """Update the UI state from a Vision MCP ``observe()`` response."""
@@ -45,7 +46,7 @@ class StateManager:
             if self._recent_all:
                 self.loop_warning = (
                     "Screen appears unchanged after your last action. "
-                    "It may not have worked -- try a different approach."
+                    "Try a different approach."
                 )
                 logger.debug("Screen unchanged warning (elements=%d)", current_count)
         else:
@@ -77,7 +78,7 @@ class StateManager:
             if count >= 2:
                 self.loop_warning = (
                     f"Action '{action_key}' has failed {count} times. "
-                    f"You MUST try a completely different action or approach."
+                    f"Try a completely different action."
                 )
         else:
             self._recent_all.append(action_key)
@@ -90,3 +91,13 @@ class StateManager:
                     f"Try a completely different approach."
                 )
                 self._recent_all.clear()
+
+    def record_empty_response(self, *, success: bool) -> None:
+        """Track consecutive empty/failed LLM responses for escalating warnings."""
+        if success:
+            self._consecutive_empty = 0
+            return
+        self._consecutive_empty += 1
+        if self._consecutive_empty >= 3:
+            self.loop_warning = f"No response {self._consecutive_empty} times in a row."
+            logger.warning("Consecutive empty LLM responses: %d", self._consecutive_empty)

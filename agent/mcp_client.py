@@ -25,17 +25,30 @@ class MCPClient:
         self.name = name
         self._session = session
         self._tools: list[str] = []
+        self._tool_schemas: dict[str, dict] = {}
 
     async def initialize(self) -> None:
         """Initialize the session and discover available tools."""
         await self._session.initialize()
         tools_response = await self._session.list_tools()
         self._tools = [t.name for t in tools_response.tools]
+        self._tool_schemas = {
+            t.name: {
+                "description": t.description or "",
+                "inputSchema": getattr(t, "inputSchema", {}) or {},
+            }
+            for t in tools_response.tools
+        }
         logger.debug("MCP '%s': connected, tools=%s", self.name, self._tools)
 
     @property
     def tools(self) -> list[str]:
         return list(self._tools)
+
+    @property
+    def tool_schemas(self) -> dict[str, dict]:
+        """Tool name -> {description, inputSchema} for each registered tool."""
+        return dict(self._tool_schemas)
 
     async def call_tool(
         self,

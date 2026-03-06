@@ -10,14 +10,14 @@ class MarkConfig:
     """All tuneable settings for mark."""
 
     # -- LLM --
-    provider: str = "openai"
     model: str | None = None
-    temperature: float = 0.1
+    temperature: float = 0.2
+    reasoning_effort: str = "medium"
+    llm_timeout: float = 30.0
 
     # -- Vision --
     screenshot_width: int = 1280
     max_elements: int = 150
-    use_omniparser: bool = False
 
     # -- Agent loop --
     max_steps: int = 100
@@ -31,6 +31,10 @@ class MarkConfig:
     # -- Conversation history --
     max_messages: int = 20
     max_recent_results: int = 5
+
+    # -- Orchestrator --
+    max_goals: int = 10
+    orchestrator_model: str | None = None
 
     # -- MCP --
     mcp_timeout: float = 30.0

@@ -29,7 +29,7 @@ def capture_screenshot(target_width: int = 1280) -> tuple[str, int, int, float]:
     scaled = screenshot.resize((target_width, new_h), Image.LANCZOS)
 
     buf = io.BytesIO()
-    scaled.save(buf, format="JPEG", quality=75)
+    scaled.save(buf, format="JPEG", quality=80)
     b64 = base64.b64encode(buf.getvalue()).decode()
 
     logger.debug(
