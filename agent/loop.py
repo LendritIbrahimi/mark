@@ -42,6 +42,7 @@ class ActionCall(BaseModel):
 
 
 class StepResponse(BaseModel):
+    observation: str = Field(description="What you see on the screen right now")
     thought: str = Field(description="Reasoning about what to do next")
     actions: list[ActionCall] = Field(min_length=1)
 
@@ -170,6 +171,9 @@ class AgentLoop:
                 logger.warning("Too many consecutive failures (%d), stopping.", self._consecutive_failures)
                 break
             await self._step()
+            if self.state.check_stale(self.config.max_stale_steps):
+                logger.warning("Goal stuck for %d consecutive steps, aborting.", self.config.max_stale_steps)
+                break
 
         if self._done:
             logger.info("Done.")
@@ -184,15 +188,15 @@ class AgentLoop:
 
     async def _summarize_goal(self) -> str:
         """Call the LLM to produce a self-contained summary of what this goal accomplished."""
-        if not self.state.recent_results:
+        if not self.state.all_results:
             return "No actions were taken."
-        messages = build_goal_self_summary_messages(self.task, list(self.state.recent_results))
+        messages = build_goal_self_summary_messages(self.task, list(self.state.all_results))
         try:
             response = await self.llm.decide(messages, GoalSummary)
             return response.result
         except Exception as exc:
             logger.warning("Goal summary LLM call failed: %s", exc)
-            return self.state.recent_results[-1]
+            return self.state.all_results[-1]
 
     async def _step(self) -> None:
         """Execute one perceive -> think -> act cycle."""
@@ -490,6 +494,7 @@ class AgentLoop:
         trace = {
             "step": self.state.step,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "observation": response.observation if response else "",
             "thought": response.thought if response else "LLM failed",
             "actions": [{"name": a.name, "params": a.params} for a in response.actions] if response else [],
             "results": results,
@@ -503,6 +508,7 @@ class AgentLoop:
         step = self.state.step
         calls = f"({self.llm.successful_calls}/{self.llm.total_calls})"
         header = f"[Step {step} \u2014 {elapsed_s:.1f}s] {calls}" if elapsed_s else f"[Step {step}] {calls}"
-        logger.info("%s %s", header, response.thought)
+        logger.info("%s [Obs] %s", header, response.observation)
+        logger.info("%s [Think] %s", header, response.thought)
         for a in response.actions:
             logger.info("  \u2192 %s(%s)", a.name, _format_params(a.params))

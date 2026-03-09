@@ -19,6 +19,7 @@ class StateManager:
     step: int = 0
     element_positions: dict[int, dict] = field(default_factory=dict)
     recent_results: list[str] = field(default_factory=list)
+    all_results: list[str] = field(default_factory=list)
     image_b64: str = ""
     elements: str = ""
     scale: float = 1.0
@@ -30,6 +31,7 @@ class StateManager:
     _recent_all: list[str] = field(default_factory=list)
     _prev_element_count: int = -1
     _consecutive_empty: int = 0
+    _consecutive_stale_steps: int = 0
 
     def update_ui(self, perception: dict) -> None:
         """Update the UI state from a Vision MCP ``observe()`` response."""
@@ -63,7 +65,8 @@ class StateManager:
         return pos["x"], pos["y"]
 
     def record_result(self, text: str) -> None:
-        """Add an action result to the rolling window."""
+        """Add an action result to the rolling window and the full history."""
+        self.all_results.append(text)
         self.recent_results.append(text)
         if len(self.recent_results) > self.max_recent_results:
             self.recent_results = self.recent_results[-self.max_recent_results:]
@@ -101,3 +104,11 @@ class StateManager:
         if self._consecutive_empty >= 3:
             self.loop_warning = f"No response {self._consecutive_empty} times in a row."
             logger.warning("Consecutive empty LLM responses: %d", self._consecutive_empty)
+
+    def check_stale(self, max_stale: int) -> bool:
+        """Return True when loop_warning has been active for *max_stale* consecutive steps."""
+        if self.loop_warning:
+            self._consecutive_stale_steps += 1
+        else:
+            self._consecutive_stale_steps = 0
+        return self._consecutive_stale_steps >= max_stale

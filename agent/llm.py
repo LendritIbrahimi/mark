@@ -1,7 +1,7 @@
-"""OpenAI LLM client with retry logic, JSON parsing, and Pydantic validation."""
 
 from __future__ import annotations
 
+"""OpenAI LLM client with retry logic, JSON parsing, and Pydantic validation."""
 import asyncio
 import json
 import logging

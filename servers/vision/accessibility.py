@@ -73,7 +73,7 @@ _DIALOG_ROLES = {"AXSheet", "AXDialog"}
 # Interactivity classification
 # ---------------------------------------------------------------------------
 
-_ACTION_REQUIRED_ROLES = {"AXStaticText"}
+_ACTION_REQUIRED_ROLES = {"AXStaticText", "AXImage"}
 
 _CLICKABLE_ACTIONS = {
     "AXPress", "AXIncrement", "AXDecrement",
@@ -384,12 +384,11 @@ class UIElement:
         cx, cy = self.center
         return {"id": self.id, "x": cx, "y": cy}
 
-    def format_entry(self, indent: int = 0) -> str:
+    def format_entry(self) -> str:
         """Format for the agent's text element list.
 
         Example: ``[3] [FOCUSED] Button: "Submit"``
         """
-        prefix = "  " * indent
         parts = [f"[{self.id}]"]
         tags = " ".join(f"[{s}]" for s in self.states)
         if tags:
@@ -397,7 +396,7 @@ class UIElement:
         if self.source:
             parts.append(f"({self.source})")
         parts.append(f'{self.display_role}: "{self.label}"' if self.label else self.display_role)
-        return prefix + " ".join(parts)
+        return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------

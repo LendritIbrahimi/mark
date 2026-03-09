@@ -11,6 +11,7 @@ import logging
 import subprocess
 import time
 
+from AppKit import NSPasteboard
 import pyautogui
 from Quartz import (
     CGEventCreateKeyboardEvent,
@@ -66,6 +67,30 @@ _MODIFIER_MAP: dict[str, int] = {
 }
 
 
+def _save_clipboard() -> list[tuple] | None:
+    """Snapshot every item on the general pasteboard so it can be restored later."""
+    pb = NSPasteboard.generalPasteboard()
+    types = pb.types()
+    if not types:
+        return None
+    saved = []
+    for t in types:
+        data = pb.dataForType_(t)
+        if data:
+            saved.append((t, bytes(data)))
+    return saved or None
+
+
+def _restore_clipboard(saved: list[tuple] | None) -> None:
+    """Put a previous snapshot back onto the general pasteboard."""
+    if not saved:
+        return
+    pb = NSPasteboard.generalPasteboard()
+    pb.clearContents()
+    for type_str, raw in saved:
+        pb.setData_forType_(raw, type_str)
+
+
 def _post_key(key_code: int, down: bool, flags: int = 0) -> None:
     event = CGEventCreateKeyboardEvent(_source, key_code, down)
     CGEventSetFlags(event, flags)
@@ -86,9 +111,11 @@ def type_text(text: str, x: int | None = None, y: int | None = None, submit: boo
             hotkey(["command", "a"])
             time.sleep(0.1)
 
+        saved = _save_clipboard()
         subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
         hotkey(["command", "v"])
         time.sleep(0.2)
+        _restore_clipboard(saved)
 
         if submit:
             time.sleep(0.1)

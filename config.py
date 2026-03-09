@@ -23,6 +23,7 @@ class MarkConfig:
     max_steps: int = 100
     max_actions_per_step: int = 10
     max_failures: int = 5
+    max_stale_steps: int = 4
     step_delay: float = 1.0
     initial_delay: float = 0.0
     send_images: bool = True
@@ -33,7 +34,8 @@ class MarkConfig:
     max_recent_results: int = 5
 
     # -- Orchestrator --
-    max_goals: int = 10
+    max_goals: int = 6
+    max_goal_retries: int = 1
     orchestrator_model: str | None = None
 
     # -- MCP --

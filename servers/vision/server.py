@@ -54,12 +54,7 @@ def observe(
         b64, [el.to_dict() for el in elements], scale, backing_scale,
     )
 
-    min_depth = min((el.depth for el in elements), default=0)
-    max_indent = 3
-    element_lines = [
-        el.format_entry(indent=min(el.depth - min_depth, max_indent))
-        for el in elements
-    ]
+    element_lines = [el.format_entry() for el in elements]
 
     return json.dumps({
         "image": labeled_b64,
