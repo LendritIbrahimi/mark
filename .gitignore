@@ -21,6 +21,7 @@ env/
 # macOS
 .DS_Store
 ._*
+mark.app/
 
 # IDE
 .idea/
@@ -32,6 +33,7 @@ env/
 # Debug logs (generated per agent run)
 debug_logs/
 **/debug_logs/
+.mcp_*.log
 
 # Temp screenshots
 *.tmp.png

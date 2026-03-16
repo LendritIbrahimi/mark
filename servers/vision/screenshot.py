@@ -4,36 +4,61 @@ from __future__ import annotations
 
 import base64
 import io
-import logging
 
-import pyautogui
+import AppKit
 from PIL import Image
+from Quartz import (
+    CGImageGetHeight,
+    CGImageGetWidth,
+    CGRectInfinite,
+    CGWindowListCreateImage,
+    kCGNullWindowID,
+    kCGWindowImageDefault,
+    kCGWindowListOptionOnScreenOnly,
+)
 
-logger = logging.getLogger(__name__)
+DEFAULT_WIDTH = 1280
 
 
-def capture_screenshot(target_width: int = 1280) -> tuple[str, int, int, float]:
-    """Capture the screen, scale to *target_width*, return as base64 JPEG.
+def _grab_screen() -> Image.Image:
+    """Capture the screen via CoreGraphics (in-process, honours TCC grant)."""
+    cg_img = CGWindowListCreateImage(
+        CGRectInfinite,
+        kCGWindowListOptionOnScreenOnly,
+        kCGNullWindowID,
+        kCGWindowImageDefault,
+    )
+    if cg_img is None:
+        raise RuntimeError(
+            "CGWindowListCreateImage returned None — "
+            "grant Screen Recording permission to mark.app in "
+            "System Settings → Privacy & Security → Screen Recording"
+        )
+    ns_img = AppKit.NSImage.alloc().initWithCGImage_size_(cg_img, AppKit.NSZeroSize)
+    tiff = ns_img.TIFFRepresentation()
+    rep = AppKit.NSBitmapImageRep.imageRepWithData_(tiff)
+    png = rep.representationUsingType_properties_(
+        AppKit.NSBitmapImageFileTypePNG, None,
+    )
+    return Image.open(io.BytesIO(bytes(png))).convert("RGB")
 
-    Returns
-    -------
-    (base64_jpeg, scaled_width, scaled_height, scale)
-        scale maps from image coords to real pixel coords (uniform, no warping).
-    """
-    screenshot = pyautogui.screenshot().convert("RGB")
+
+def capture_screenshot(
+        target_width: int = DEFAULT_WIDTH,
+) -> tuple[str, int, int, float]:
+    """Returns (b64_jpeg, width, height, scale)."""
+    screenshot = _grab_screen()
     real_w, real_h = screenshot.size
 
     scale = real_w / target_width
     new_h = round(real_h / scale)
 
-    scaled = screenshot.resize((target_width, new_h), Image.LANCZOS)
+    scaled = screenshot.resize(
+        (target_width, new_h), Image.LANCZOS,
+    )
 
     buf = io.BytesIO()
     scaled.save(buf, format="JPEG", quality=80)
     b64 = base64.b64encode(buf.getvalue()).decode()
 
-    logger.debug(
-        "Screenshot: %dx%d -> %dx%d (scale %.2f)",
-        real_w, real_h, target_width, new_h, scale,
-    )
     return b64, target_width, new_h, scale

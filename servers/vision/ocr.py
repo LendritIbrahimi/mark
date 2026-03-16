@@ -1,8 +1,4 @@
-"""macOS native OCR via the Vision framework (VNRecognizeTextRequest).
-
-Provides reusable text recognition for any CGImage, returning element
-dicts with point-space coordinates ready for UIElement construction.
-"""
+"""macOS native OCR via the Vision framework."""
 
 from __future__ import annotations
 
@@ -20,45 +16,47 @@ logger = logging.getLogger(__name__)
 
 
 def capture_window_image(window_id: int) -> Any | None:
-    """Capture a CGImage of a single window by its CGWindowList ID."""
-    cg_image = CGWindowListCreateImage(
+    return CGWindowListCreateImage(
         CGRectNull,
         kCGWindowListOptionIncludingWindow,
         window_id,
         kCGWindowImageBoundsIgnoreFraming,
     )
-    return cg_image
 
 
-def ocr_image(cg_image: Any, bounds: dict, role: str = "AXStaticText") -> list[dict]:
-    """Run macOS Vision OCR on a CGImage, return element dicts in point-space.
-
-    Parameters
-    ----------
-    cg_image : A Quartz CGImageRef.
-    bounds : dict with keys x, y, w, h (point-space window bounds).
-    role : AX role to assign to each detected text element.
-
-    Returns
-    -------
-    list of dicts: {role, label, x, y, w, h, states}, sorted top-to-bottom.
-    """
+def ocr_image(
+        cg_image: Any,
+        bounds: dict,
+        role: str = "AXStaticText",
+) -> list[dict]:
+    """Run Vision OCR on a CG image and return elements."""
     try:
         import Vision
     except ImportError:
-        logger.warning("pyobjc-framework-Vision not installed; OCR disabled")
+        logger.warning(
+            "pyobjc-framework-Vision not installed; "
+            "OCR disabled",
+        )
         return []
 
-    handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(
-        cg_image, None,
+    handler = (
+        Vision.VNImageRequestHandler
+        .alloc()
+        .initWithCGImage_options_(cg_image, None)
     )
-    request = Vision.VNRecognizeTextRequest.alloc().init()
-    request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+    request = (
+        Vision.VNRecognizeTextRequest.alloc().init()
+    )
+    request.setRecognitionLevel_(
+        Vision.VNRequestTextRecognitionLevelAccurate,
+    )
     request.setUsesLanguageCorrection_(True)
 
-    success, error = handler.performRequests_error_([request], None)
+    success, error = handler.performRequests_error_(
+        [request], None,
+    )
     if not success:
-        logger.warning("Vision OCR failed: %s", error)
+        logger.error("Vision OCR failed: %s", error)
         return []
 
     observations = request.results()
@@ -78,9 +76,11 @@ def ocr_image(cg_image: Any, bounds: dict, role: str = "AXStaticText") -> list[d
             continue
 
         bbox = obs.boundingBox()
-        # Vision coords: normalised 0-1, origin at bottom-left.
-        # Convert to point-space with top-left origin.
-        py = wy + (1.0 - bbox.origin.y - bbox.size.height) * wh
+        py = (
+                wy
+                + (1.0 - bbox.origin.y - bbox.size.height)
+                * wh
+        )
         ph = bbox.size.height * wh
 
         if ph < 5:
@@ -97,6 +97,4 @@ def ocr_image(cg_image: Any, bounds: dict, role: str = "AXStaticText") -> list[d
         })
 
     items.sort(key=lambda d: d["y"])
-
-    logger.info("OCR found %d text items in region (%d,%d %dx%d)", len(items), wx, wy, ww, wh)
     return items

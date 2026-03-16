@@ -1,4 +1,4 @@
-"""Thin MCP client wrapper for connecting to stdio-based MCP servers."""
+"""MCP client wrapper for stdio-based MCP servers."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
 
@@ -15,31 +14,37 @@ from mcp.client.stdio import stdio_client
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)),
+)
 
 
 class MCPClient:
-    """Manages a connection to a single MCP server subprocess."""
+    """Manages a connection to a single MCP server."""
 
-    def __init__(self, name: str, session: ClientSession) -> None:
+    def __init__(
+            self, name: str, session: ClientSession,
+    ) -> None:
         self.name = name
         self._session = session
         self._tools: list[str] = []
         self._tool_schemas: dict[str, dict] = {}
 
     async def initialize(self) -> None:
-        """Initialize the session and discover available tools."""
         await self._session.initialize()
         tools_response = await self._session.list_tools()
-        self._tools = [t.name for t in tools_response.tools]
+        self._tools = [
+            t.name for t in tools_response.tools
+        ]
         self._tool_schemas = {
             t.name: {
                 "description": t.description or "",
-                "inputSchema": getattr(t, "inputSchema", {}) or {},
+                "inputSchema": (
+                        getattr(t, "inputSchema", {}) or {}
+                ),
             }
             for t in tools_response.tools
         }
-        logger.debug("MCP '%s': connected, tools=%s", self.name, self._tools)
 
     @property
     def tools(self) -> list[str]:
@@ -47,34 +52,36 @@ class MCPClient:
 
     @property
     def tool_schemas(self) -> dict[str, dict]:
-        """Tool name -> {description, inputSchema} for each registered tool."""
         return dict(self._tool_schemas)
 
     async def call_tool(
-        self,
-        name: str,
-        arguments: dict[str, Any] | None = None,
-        timeout: float = 30.0,
+            self,
+            name: str,
+            arguments: dict[str, Any] | None = None,
+            timeout: float = 30.0,
     ) -> Any:
-        """Call a tool on the MCP server and return the parsed result.
-
-        Raises RuntimeError if the tool call reports an error or times out.
-        """
-        logger.debug("MCP '%s': calling %s(%s)", self.name, name, arguments)
         try:
             result = await asyncio.wait_for(
-                self._session.call_tool(name, arguments or {}),
+                self._session.call_tool(
+                    name, arguments or {},
+                ),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
-            msg = f"MCP tool {name} timed out after {timeout:.0f}s"
-            logger.error("MCP '%s': %s", self.name, msg)
-            raise RuntimeError(msg) from None
+            raise RuntimeError(
+                f"MCP tool {name} timed out "
+                f"after {timeout:.0f}s",
+            ) from None
 
         if getattr(result, "isError", False):
-            error_text = str(result.content) if result.content else "Unknown MCP error"
-            logger.error("MCP '%s': tool %s error: %s", self.name, name, error_text)
-            raise RuntimeError(f"MCP tool {name} failed: {error_text}")
+            error_text = (
+                str(result.content)
+                if result.content
+                else "Unknown MCP error"
+            )
+            raise RuntimeError(
+                f"MCP tool {name} failed: {error_text}",
+            )
 
         text_parts = []
         for block in result.content:
@@ -89,33 +96,78 @@ class MCPClient:
             return raw
 
 
+_CLEANUP_EXC = (
+    OSError, BrokenPipeError, ConnectionError,
+    EOFError, asyncio.CancelledError,
+)
+
+
+def _is_cleanup_noise(exc: BaseException) -> bool:
+    """True for exceptions that are just MCP subprocess teardown noise."""
+    return isinstance(exc, _CLEANUP_EXC)
+
+
 @asynccontextmanager
 async def connect_mcp(
-    name: str,
-    command: str,
-    args: list[str],
+        name: str,
+        command: str,
+        args: list[str],
 ) -> AsyncGenerator[MCPClient, None]:
-    """Context manager that starts an MCP server subprocess and yields a connected client."""
     env = os.environ.copy()
-    env["PYTHONPATH"] = PROJECT_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+            PROJECT_ROOT
+            + os.pathsep
+            + env.get("PYTHONPATH", "")
+    )
 
     server_params = StdioServerParameters(
-        command=command,
-        args=args,
-        env=env,
+        command=command, args=args, env=env,
     )
-    logger.debug("Starting MCP server '%s': %s %s", name, command, " ".join(args))
-
-    quiet = os.environ.get("MARK_LOG_LEVEL", "WARNING") != "DEBUG"
-    errlog = open(os.devnull, "w") if quiet else sys.stderr
+    log_path = os.path.join(
+        PROJECT_ROOT, f".mcp_{name}.log",
+    )
+    errlog = open(log_path, "w")
 
     try:
-        async with stdio_client(server_params, errlog=errlog) as (read, write):
-            async with ClientSession(read, write) as session:
+        async with stdio_client(
+                server_params, errlog=errlog,
+        ) as (read, write):
+            async with ClientSession(
+                    read, write,
+            ) as session:
                 client = MCPClient(name, session)
                 await client.initialize()
                 yield client
-        logger.debug("MCP server '%s' disconnected", name)
+    except BaseExceptionGroup as eg:
+        real, cleanup = eg.split(
+            lambda e: not _is_cleanup_noise(e),
+        )
+        if cleanup:
+            logger.debug(
+                "MCP '%s' cleanup errors suppressed: %s",
+                name, cleanup,
+            )
+        if real:
+            _log_server_stderr(name, log_path, errlog)
+            raise real
+    except BaseException:
+        _log_server_stderr(name, log_path, errlog)
+        raise
     finally:
-        if errlog is not sys.stderr:
-            errlog.close()
+        errlog.close()
+
+
+def _log_server_stderr(
+        name: str, log_path: str, errlog: Any,
+) -> None:
+    errlog.flush()
+    try:
+        with open(log_path, "r") as f:
+            stderr_out = f.read().strip()
+        if stderr_out:
+            logger.error(
+                "MCP server '%s' stderr:\n%s",
+                name, stderr_out,
+            )
+    except OSError:
+        pass
