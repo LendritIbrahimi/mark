@@ -123,10 +123,7 @@ async def connect_mcp(
     server_params = StdioServerParameters(
         command=command, args=args, env=env,
     )
-    log_path = os.path.join(
-        PROJECT_ROOT, f".mcp_{name}.log",
-    )
-    errlog = open(log_path, "w")
+    errlog = open(os.devnull, "w")
 
     try:
         async with stdio_client(
@@ -148,26 +145,6 @@ async def connect_mcp(
                 name, cleanup,
             )
         if real:
-            _log_server_stderr(name, log_path, errlog)
             raise real
-    except BaseException:
-        _log_server_stderr(name, log_path, errlog)
-        raise
     finally:
         errlog.close()
-
-
-def _log_server_stderr(
-        name: str, log_path: str, errlog: Any,
-) -> None:
-    errlog.flush()
-    try:
-        with open(log_path, "r") as f:
-            stderr_out = f.read().strip()
-        if stderr_out:
-            logger.error(
-                "MCP server '%s' stderr:\n%s",
-                name, stderr_out,
-            )
-    except OSError:
-        pass

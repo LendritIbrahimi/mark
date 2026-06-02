@@ -113,6 +113,13 @@ def build_step_message(state: StateManager) -> dict:
             parts.append("\nPrevious results:")
             parts.extend(f"  - {r}" for r in successes)
 
+    if recent:
+        parts.append(
+            "\nBEFORE choosing actions: verify from the screenshot whether "
+            "your previous action achieved the expected result. "
+            "If not, adjust your approach."
+        )
+
     if state.user_guidance:
         parts.append(f"\nUser guidance: {state.user_guidance}")
         state.user_guidance = ""
@@ -163,9 +170,9 @@ def build_decompose_messages(task: str) -> list[dict]:
 
         ## Examples
 
-        Task: "hover the mouse on the first pug dog you see"
+        Task: "click on the first pug dog you see"
           -> {"goals": [
-               "Hover the mouse over the first pug dog image visible on screen — the cursor should be resting on a pug image"
+               "Click on the first pug dog image visible on screen — the image should be selected or opened"
              ]}
 
         Task: "open Safari and search for cute cats"
@@ -274,14 +281,18 @@ def build_validate_goal_messages(
     system_content = textwrap.dedent("""\
         You are a quality-assurance evaluator for a macOS desktop automation agent.
         You will receive the overall task, the specific goal that was just attempted,
-        and a summary of what happened. Determine whether the goal was completed
-        successfully.
+        a summary of what happened, and a screenshot of the current screen state.
+
+        Use BOTH the text summary AND the screenshot to judge whether the goal
+        was truly accomplished. The screenshot is ground truth -- if the text
+        claims success but the screenshot shows otherwise, trust the screenshot.
 
         Look for signs of failure such as:
         - Wrong content was acted on
         - Target app or page was not reached
         - An error or unexpected state is described
         - Goal's core objective was not achieved
+        - Screenshot does not show the expected end state
 
         Be lenient on minor deviations -- only flag clear failures.
 

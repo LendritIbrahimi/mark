@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import threading
 
@@ -36,7 +37,7 @@ class MarkApp(ctk.CTk):
         self._agent_loop: asyncio.AbstractEventLoop | None = None
         self._callbacks: AgentCallbacks | None = None
         self._guidance_text: str | None = None
-        self._guidance_lock = threading.Lock()
+        self._lock = threading.Lock()
         self._step_cards: dict[tuple[int, int], StepCard] = {}
         self._current_goal: int = 0
         self._running = False
@@ -193,7 +194,7 @@ class MarkApp(ctk.CTk):
         ctk.CTkLabel(self._cfg_frame, text="  reasoning", **lbl_kw).grid(
             row=r, column=0, sticky="w", padx=0, pady=1,
         )
-        self._reason_var = ctk.StringVar(master=self, value="medium")
+        self._reason_var = ctk.StringVar(master=self, value=MarkConfig.reasoning_effort)
         ctk.CTkComboBox(
             self._cfg_frame, values=REASONING_LEVELS,
             variable=self._reason_var,
@@ -211,9 +212,9 @@ class MarkApp(ctk.CTk):
         )
         tf = ctk.CTkFrame(self._cfg_frame, fg_color="transparent")
         tf.grid(row=r, column=1, padx=PAD, pady=1, sticky="e")
-        self._temp_var = ctk.DoubleVar(master=self, value=0.2)
+        self._temp_var = ctk.DoubleVar(master=self, value=MarkConfig.temperature)
         self._temp_lbl = ctk.CTkLabel(
-            tf, text="0.20",
+            tf, text=f"{MarkConfig.temperature:.2f}",
             font=ctk.CTkFont(family=MONO, size=13),
             text_color=FG, width=32,
         )
@@ -240,7 +241,9 @@ class MarkApp(ctk.CTk):
         )
 
         self._vision_var = ctk.BooleanVar(master=self, value=True)
-        ctk.CTkSwitch(sw_frame, text="vision", variable=self._vision_var, **sw_kw
+        ctk.CTkSwitch(
+            sw_frame, text="vision", variable=self._vision_var,
+            command=self._on_vision_toggle, **sw_kw,
         ).grid(row=0, column=0, sticky="w", pady=(0, 2))
 
         self._orch_var = ctk.BooleanVar(master=self, value=True)
@@ -254,6 +257,13 @@ class MarkApp(ctk.CTk):
         self._debug_var = ctk.BooleanVar(master=self, value=False)
         ctk.CTkSwitch(sw_frame, text="debug logs", variable=self._debug_var, **sw_kw
         ).grid(row=1, column=1, sticky="w")
+
+        self._omniparser_var = ctk.BooleanVar(master=self, value=False)
+        self._omniparser_switch = ctk.CTkSwitch(
+            sw_frame, text="omniparser", variable=self._omniparser_var,
+            **sw_kw,
+        )
+        self._omniparser_switch.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         r += 1
         self._adv_open = False
@@ -272,17 +282,18 @@ class MarkApp(ctk.CTk):
         self._adv_row = r
 
         adv_defs = [
-            ("llm_timeout", "llm_timeout", "30.0"),
-            ("mcp_timeout", "mcp_timeout", "30.0"),
-            ("max_failures", "max_failures", "5"),
-            ("max_stale_steps", "max_stale", "5"),
-            ("step_delay", "step_delay", "1.0"),
-            ("post_action_delay", "action_delay", "2.0"),
-            ("max_messages", "max_messages", "20"),
-            ("max_goals", "max_goals", "6"),
+            ("llm_timeout", "llm_timeout"),
+            ("mcp_timeout", "mcp_timeout"),
+            ("max_failures", "max_failures"),
+            ("max_stale_steps", "max_stale"),
+            ("step_delay", "step_delay"),
+            ("post_action_delay", "action_delay"),
+            ("max_messages", "max_messages"),
+            ("max_goals", "max_goals"),
         ]
         self._adv_vars: dict[str, ctk.StringVar] = {}
-        for i, (key, label, default) in enumerate(adv_defs):
+        for i, (key, label) in enumerate(adv_defs):
+            default = str(MarkConfig.__dataclass_fields__[key].default)
             ctk.CTkLabel(
                 self._adv_frame, text=f"  {label}",
                 font=ctk.CTkFont(family=MONO, size=13),
@@ -296,6 +307,10 @@ class MarkApp(ctk.CTk):
                 **entry_kw,
             ).grid(row=i, column=1, padx=PAD, pady=1, sticky="e")
             self._adv_vars[key] = v
+
+    def _task_entry_return(self, event) -> str:
+        self._run_agent()
+        return "break"  # prevent newline insertion
 
     def _toggle_config(self) -> None:
         self._cfg_open = not self._cfg_open
@@ -313,6 +328,15 @@ class MarkApp(ctk.CTk):
             self._price_lbl.configure(text=f"${inp:g} in \u00b7 ${out:g} out /MTok")
         else:
             self._price_lbl.configure(text="")
+
+    def _on_vision_toggle(self) -> None:
+        if self._vision_var.get():
+            self._omniparser_switch.grid(
+                row=2, column=0, columnspan=2, sticky="w", pady=(2, 0),
+            )
+        else:
+            self._omniparser_var.set(False)
+            self._omniparser_switch.grid_forget()
 
     def _toggle_adv(self) -> None:
         self._adv_open = not self._adv_open
@@ -338,15 +362,16 @@ class MarkApp(ctk.CTk):
             text_color=FG_FAINT, anchor="w", width=36,
         ).pack(side="left")
 
-        self._task_entry = ctk.CTkEntry(
-            tf, placeholder_text="",
-            height=26, fg_color=SURFACE,
-            border_color=BORDER, text_color=FG,
+        self._task_entry = ctk.CTkTextbox(
+            tf,
+            height=28, fg_color=SURFACE,
+            border_color=BORDER, border_width=2, text_color=FG,
             font=ctk.CTkFont(family=MONO, size=13),
-            corner_radius=0,
+            corner_radius=0, wrap="word",
+            activate_scrollbars=False,
         )
         self._task_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
-        self._task_entry.bind("<Return>", lambda _e: self._run_agent())
+        self._task_entry.bind("<Return>", self._task_entry_return)
 
         bf = ctk.CTkFrame(p, fg_color="transparent")
         bf.pack(fill="x", pady=(0, 2))
@@ -454,10 +479,12 @@ class MarkApp(ctk.CTk):
         self._steps_frame.pack(fill="both", expand=True, pady=(0, 2))
 
     def _scroll_steps_down(self) -> None:
-        self.after(
-            60,
-            lambda: self._steps_frame._parent_canvas.yview_moveto(1.0),
-        )
+        def _scroll() -> None:
+            try:
+                self._steps_frame._parent_canvas.yview_moveto(1.0)
+            except AttributeError:
+                pass
+        self.after(60, _scroll)
 
     # -- guidance --
 
@@ -511,18 +538,19 @@ class MarkApp(ctk.CTk):
             "send_images": self._vision_var.get(),
             "allow_plan_edit": self._plan_edit_var.get(),
             "save_debug_logs": self._debug_var.get(),
+            "use_omniparser": self._omniparser_var.get(),
         }
         for key, var in self._adv_vars.items():
             raw = var.get()
             try:
-                meta = MarkConfig.__dataclass_fields__[key]
-                kw[key] = int(raw) if "int" in str(meta.type) else float(raw)
-            except (ValueError, KeyError):
+                default = MarkConfig.__dataclass_fields__[key].default
+                kw[key] = type(default)(raw)
+            except (ValueError, KeyError, TypeError):
                 pass
         return MarkConfig(**kw)
 
     def _run_agent(self) -> None:
-        task = self._task_entry.get().strip()
+        task = self._task_entry.get("1.0", "end-1c").strip()
         if not task or self._running:
             return
 
@@ -546,7 +574,7 @@ class MarkApp(ctk.CTk):
         self._run_btn.configure(state="disabled")
         self._pause_btn.configure(state="normal", text="[ pause ]")
         self._stop_btn.configure(state="normal")
-        self._task_entry.configure(state="disabled")
+        self._task_entry.configure(state="disabled", text_color=FG_DIM)
         self._status.configure(text="> starting...", text_color=FG)
         self._goal_lbl.configure(text="")
 
@@ -555,6 +583,7 @@ class MarkApp(ctk.CTk):
 
         self._callbacks = AgentCallbacks(
             on_step_start=lambda s: self.after(0, self._ui_step_start, s),
+            on_perceive_start=lambda s, omni: self.after(0, self._ui_perceive_start, s, omni),
             on_think=lambda s, o, t, a: self.after(0, self._ui_think, s, o, t, a),
             on_action_result=lambda s, n, r: self.after(0, self._ui_action_result, s, n, r),
             on_goal_start=lambda i, t, g: self.after(0, self._ui_goal_start, i, t, g),
@@ -562,7 +591,7 @@ class MarkApp(ctk.CTk):
             on_decompose=lambda g: self.after(0, self._ui_decompose, g),
             on_done=lambda r: self.after(0, self._ui_done, r),
             get_guidance=self._consume_guidance,
-            get_plan=lambda: self._pending_plan,
+            get_plan=self._consume_plan,
         )
 
         self._agent_thread = threading.Thread(
@@ -602,6 +631,9 @@ class MarkApp(ctk.CTk):
             self.after(0, self._ui_finished)
 
     async def _async_run(self, task: str, config: MarkConfig, use_orch: bool) -> None:
+        if config.use_omniparser:
+            url = f"http://127.0.0.1:{config.omniparser_port}"
+            os.environ["OMNIPARSER_LOCAL_URL"] = url
         async with connect_mcp(
             "vision", sys.executable, ["-m", "servers.vision.server"],
         ) as vision:
@@ -656,7 +688,7 @@ class MarkApp(ctk.CTk):
         text = self._guide_entry.get().strip()
         if not text:
             return
-        with self._guidance_lock:
+        with self._lock:
             self._guidance_text = text
         self._guide_entry.delete(0, "end")
         self._guide_status.configure(
@@ -665,7 +697,7 @@ class MarkApp(ctk.CTk):
         )
 
     def _consume_guidance(self) -> str | None:
-        with self._guidance_lock:
+        with self._lock:
             text = self._guidance_text
             self._guidance_text = None
         if text is not None:
@@ -674,6 +706,12 @@ class MarkApp(ctk.CTk):
                 lambda: self._guide_status.configure(text="", text_color=FG_FAINT),
             )
         return text
+
+    def _consume_plan(self) -> list[str] | None:
+        with self._lock:
+            plan = self._pending_plan
+            self._pending_plan = None
+        return plan
 
     # -- plan editor --
 
@@ -701,7 +739,6 @@ class MarkApp(ctk.CTk):
             self._goal_entries.append(tb)
 
     def _read_goal_boxes(self) -> list[str]:
-        import re
         goals = []
         for tb in self._goal_entries:
             text = tb.get("1.0", "end").strip()
@@ -711,8 +748,9 @@ class MarkApp(ctk.CTk):
 
     def _confirm_plan(self) -> None:
         goals = self._read_goal_boxes()
-        if goals:
-            self._pending_plan = goals
+        with self._lock:
+            if goals:
+                self._pending_plan = goals
         self._plan_editor.pack_forget()
         if self._callbacks is not None:
             self._callbacks.plan_confirm_event.set()
@@ -768,6 +806,13 @@ class MarkApp(ctk.CTk):
 
     def _card_key(self, step: int) -> tuple[int, int]:
         return (self._current_goal, step)
+
+    def _ui_perceive_start(self, step: int, omniparser: bool) -> None:
+        if omniparser:
+            self._status.configure(
+                text=f"> step {step}: parsing screen (omniparser)...",
+                text_color=FG,
+            )
 
     def _ui_step_start(self, step: int) -> None:
         for card in self._step_cards.values():
@@ -859,7 +904,7 @@ class MarkApp(ctk.CTk):
         self._run_btn.configure(state="normal")
         self._pause_btn.configure(state="disabled", text="[ pause ]")
         self._stop_btn.configure(state="disabled")
-        self._task_entry.configure(state="normal")
+        self._task_entry.configure(state="normal", text_color=FG)
         status_text = self._status.cget("text")
         if status_text.startswith("> stopping"):
             self._status.configure(text="> stopped", text_color=FG_RED)

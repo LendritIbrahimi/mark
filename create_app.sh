@@ -11,7 +11,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cat > "$APP/Contents/MacOS/mark" << LAUNCHER
 #!/bin/bash
 cd "$DIR"
-exec "$DIR/.venv/bin/python" -m ui.app 2>>"$DIR/mark_app.log"
+exec "$DIR/.venv/bin/python" -m ui.app 2>/dev/null
 LAUNCHER
 chmod +x "$APP/Contents/MacOS/mark"
 

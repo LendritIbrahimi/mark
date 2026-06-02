@@ -43,10 +43,26 @@ def _grab_screen() -> Image.Image:
     return Image.open(io.BytesIO(bytes(png))).convert("RGB")
 
 
+def get_backing_scale() -> float:
+    """Current display backing scale (2.0 on Retina, 1.0 otherwise)."""
+    screen = AppKit.NSScreen.mainScreen()
+    if screen is None:
+        return 2.0
+    return float(screen.backingScaleFactor())
+
+
 def capture_screenshot(
         target_width: int = DEFAULT_WIDTH,
-) -> tuple[str, int, int, float]:
-    """Returns (b64_jpeg, width, height, scale)."""
+        image_format: str = "jpeg",
+) -> tuple[str, int, int, float, float]:
+    """Returns (b64_image, width, height, scale, backing_scale).
+
+    Args:
+        target_width: Resize the screenshot to this width (aspect ratio preserved).
+        image_format: ``"jpeg"`` (smaller, lossy) or ``"png"`` (lossless, better
+            for OCR / OmniParser).
+    """
+    backing_scale = get_backing_scale()
     screenshot = _grab_screen()
     real_w, real_h = screenshot.size
 
@@ -58,7 +74,10 @@ def capture_screenshot(
     )
 
     buf = io.BytesIO()
-    scaled.save(buf, format="JPEG", quality=80)
+    if image_format == "png":
+        scaled.save(buf, format="PNG")
+    else:
+        scaled.save(buf, format="JPEG", quality=85)
     b64 = base64.b64encode(buf.getvalue()).decode()
 
-    return b64, target_width, new_h, scale
+    return b64, target_width, new_h, scale, backing_scale

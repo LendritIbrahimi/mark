@@ -15,7 +15,6 @@ _ACTION_REGISTRY: list[tuple[str, str, str, str]] = [
     ("click",        "click",        "element_id",                     "Mouse"),
     ("double_click", "double_click", "element_id",                     "Mouse"),
     ("right_click",  "right_click",  "element_id",                     "Mouse"),
-    ("hover",        "hover_at",     "element_id",                     "Mouse"),
     ("drag",         "drag_to",      "from_element_id, to_element_id", "Mouse"),
     ("scroll",       "scroll_at",    "direction, amount",              "Mouse"),
     ("type_text",    "type_text",    "text, element_id?, submit?",     "Keyboard"),

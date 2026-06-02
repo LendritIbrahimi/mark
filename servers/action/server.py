@@ -66,18 +66,6 @@ def right_click(x: int, y: int) -> str:
 
 
 @mcp.tool()
-def hover_at(x: int, y: int) -> str:
-    """Hover over an element without clicking."""
-    ok = mouse.hover(x, y)
-    msg = (
-        f"Hovered at ({x}, {y})"
-        if ok
-        else f"Hover at ({x}, {y}) failed"
-    )
-    return _result(ok, msg)
-
-
-@mcp.tool()
 def drag_to(
         from_x: int, from_y: int,
         to_x: int, to_y: int,

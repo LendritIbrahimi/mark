@@ -32,6 +32,11 @@ from agent.state import StateManager
 
 logger = logging.getLogger(__name__)
 
+_UI_MUTATING = {
+    "click", "double_click", "right_click",
+    "scroll", "type_text", "press_key", "hotkey",
+}
+
 
 class ActionCall(BaseModel):
     """A single action the LLM wants to execute."""
@@ -64,6 +69,7 @@ class AgentLoop:
             callbacks: AgentCallbacks | None = None,
             goal_idx: int = 1,
             session_dir: str | None = None,
+            retry_context: list[str] | None = None,
     ) -> None:
         self.task = task
         self.config = config
@@ -74,6 +80,9 @@ class AgentLoop:
             goal=task,
             max_recent_results=config.max_recent_results,
         )
+        if retry_context:
+            for line in retry_context:
+                self.state.record_result(line)
         self._executor = ActionExecutor(
             action, self.state, mcp_timeout=config.mcp_timeout,
         )
@@ -190,8 +199,14 @@ class AgentLoop:
             self._cb.emit("on_think", step, "Step failed", str(exc), [])
 
     async def _perceive(self, step_dir: str) -> None:
+        tool = "observe_omniparser" if self.config.use_omniparser else "observe"
+        if self.config.use_omniparser:
+            timeout = max(self.config.mcp_timeout, 600.0)
+            self._cb.emit("on_perceive_start", self.state.step, True)
+        else:
+            timeout = self.config.mcp_timeout
         perception = await self.vision.call_tool(
-            "observe", {}, timeout=self.config.mcp_timeout,
+            tool, {}, timeout=timeout,
         )
         self.state.update_ui(perception)
 
@@ -272,6 +287,7 @@ class AgentLoop:
                     self._done = True
                     self._cb.emit("on_done", result.get("message", "Done"))
                     break
+
 
             except Exception as exc:
                 msg = f"{name} error: {exc}"

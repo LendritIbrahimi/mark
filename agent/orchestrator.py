@@ -75,28 +75,49 @@ class Orchestrator:
         is_simple = await self._triage()
 
         if is_simple:
-            goals = [self.task]
-            logger.info(
-                "Simple task, skipping decomposition.",
+            logger.info("Simple task, skipping decomposition.")
+            result, screenshot = await self._execute_goal(
+                self.task, 1, session_dir,
             )
+            validation = await self._validate_goal(
+                self.task, result, screenshot,
+            )
+            if validation.success:
+                return result
+            # Triage was wrong — escalate to decomposition
+            logger.warning(
+                "Simple-mode failed (%s), escalating to decomposition.",
+                validation.reason,
+            )
+            goals = await self._decompose()
+            previous_result = result
         else:
             goals = await self._decompose()
-            self._cb.emit("on_decompose", goals)
-            if self.config.allow_plan_edit:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, self._cb.plan_confirm_event.wait,
-                )
-                if self._cb.get_plan is not None:
-                    modified = self._cb.get_plan()
-                    if modified:
-                        goals = modified
-            logger.info(
-                "Decomposed into %d goals.", len(goals),
-            )
-            for i, g in enumerate(goals, 1):
-                logger.info("  Goal %d: %s", i, g)
+            previous_result = None
 
-        previous_result: str | None = None
+        self._cb.emit("on_decompose", goals)
+        if self.config.allow_plan_edit:
+            await asyncio.get_running_loop().run_in_executor(
+                None, self._cb.plan_confirm_event.wait,
+            )
+            if self._cb.get_plan is not None:
+                modified = self._cb.get_plan()
+                if modified:
+                    goals = modified
+        logger.info("Decomposed into %d goals.", len(goals))
+        for i, g in enumerate(goals, 1):
+            logger.info("  Goal %d: %s", i, g)
+
+        return await self._execute_plan(
+            goals, session_dir, previous_result,
+        )
+
+    async def _execute_plan(
+            self,
+            goals: list[str],
+            session_dir: str,
+            previous_result: str | None = None,
+    ) -> str:
         replans_done = 0
         goals_log: list[str] = []
 
@@ -122,14 +143,17 @@ class Orchestrator:
                 self._cb.emit(
                     "on_goal_start", idx, len(goals), goal,
                 )
-                result = await self._execute_goal(goal, idx, session_dir)
+                result, screenshot = await self._execute_goal(
+                    goal, idx, session_dir,
+                )
 
                 goal_succeeded = False
+                retry_context: list[str] | None = None
                 for attempt in range(
                         self.config.max_goal_retries,
                 ):
                     validation = await self._validate_goal(
-                        goal, result,
+                        goal, result, screenshot,
                     )
                     if validation.success:
                         goal_succeeded = True
@@ -141,6 +165,10 @@ class Orchestrator:
                         attempt + 1,
                         validation.reason,
                     )
+                    retry_context = [
+                        f"PREVIOUS ATTEMPT FAILED: {validation.reason}",
+                        f"Previous result: {result}",
+                    ]
                     goal = await self._refine_goal(
                         goal,
                         (
@@ -153,7 +181,10 @@ class Orchestrator:
                         idx, len(goals), goal,
                     )
                     self._cb.emit("on_goal_start", idx, len(goals), goal)
-                    result = await self._execute_goal(goal, idx, session_dir)
+                    result, screenshot = await self._execute_goal(
+                        goal, idx, session_dir,
+                        retry_context=retry_context,
+                    )
 
                 previous_result = result
                 self._cb.emit(
@@ -200,6 +231,10 @@ class Orchestrator:
                 break  # for loop completed normally — exit while
 
         return previous_result or "No result."
+
+    # ------------------------------------------------------------------
+    # LLM helpers
+    # ------------------------------------------------------------------
 
     async def _triage(self) -> bool:
         messages = build_triage_messages(self.task)
@@ -248,6 +283,7 @@ class Orchestrator:
 
     async def _validate_goal(
             self, goal: str, result: str,
+            screenshot_b64: str = "",
     ) -> GoalValidation:
         messages = build_validate_goal_messages(
             self.task, goal, result,
@@ -255,6 +291,7 @@ class Orchestrator:
         try:
             return await self.planner_llm.decide(
                 messages, GoalValidation,
+                image_b64=screenshot_b64 if self.config.send_images else None,
             )
         except Exception:
             return GoalValidation(
@@ -281,12 +318,18 @@ class Orchestrator:
             return [self.task]
 
     async def _execute_goal(
-            self, goal: str, goal_idx: int = 1, session_dir: str = "",
-    ) -> str:
+            self,
+            goal: str,
+            goal_idx: int = 1,
+            session_dir: str = "",
+            retry_context: list[str] | None = None,
+    ) -> tuple[str, str]:
         agent = AgentLoop(
             goal, self.config, self.vision, self.action,
             callbacks=self._cb,
             goal_idx=goal_idx,
             session_dir=session_dir or None,
+            retry_context=retry_context,
         )
-        return await agent.run()
+        result = await agent.run()
+        return result, agent.state.image_b64 or ""

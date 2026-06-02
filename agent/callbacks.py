@@ -21,6 +21,7 @@ class AgentCallbacks:
     """
 
     on_step_start: Callable[[int], Any] | None = None
+    on_perceive_start: Callable[[int, bool], Any] | None = None
     on_think: Callable[[int, str, str, list[dict]], Any] | None = None
     on_action_result: Callable[[int, str, dict], Any] | None = None
     on_goal_start: Callable[[int, int, str], Any] | None = None

@@ -121,7 +121,7 @@ def type_text(
             mouse_click(x, y)
             time.sleep(0.3)
             hotkey(["command", "a"])
-            time.sleep(0.1)
+            time.sleep(0.15)
 
         saved = _save_clipboard()
         subprocess.run(
@@ -130,7 +130,7 @@ def type_text(
             check=True,
         )
         hotkey(["command", "v"])
-        time.sleep(0.2)
+        time.sleep(0.6)
         _restore_clipboard(saved)
 
         if submit:
