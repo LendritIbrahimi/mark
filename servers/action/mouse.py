@@ -295,11 +295,11 @@ def scroll(direction: str, amount: int = 3) -> bool:
         unit = kCGScrollEventUnitLine
         if direction == "up":
             ev = CGEventCreateScrollWheelEvent(
-                _source, unit, 1, clamped * 3,
+                _source, unit, 1, -clamped * 3,
             )
         elif direction == "down":
             ev = CGEventCreateScrollWheelEvent(
-                _source, unit, 1, -clamped * 3,
+                _source, unit, 1, clamped * 3,
             )
         elif direction == "left":
             ev = CGEventCreateScrollWheelEvent(
