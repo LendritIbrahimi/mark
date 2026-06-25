@@ -6,6 +6,9 @@ You type a task in plain English, like "open Safari and search for cute cats", a
 mark looks at your screen, figures out the steps, and controls the mouse and keyboard
 to get it done.
 
+<img width="600" src="https://github.com/user-attachments/assets/c405d491-0d45-43c1-9c5b-0f6b0cf5b3e3" />
+
+
 ## Requirements
 
 - macOS
